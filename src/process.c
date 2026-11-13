@@ -8960,7 +8960,7 @@ allow them to produce more output before Emacs tries to read it.
 If the value is t, the delay is reset after each write to the process; any other
 non-nil value means that the delay is not reset on write.
 The variable takes effect when `start-process' is called.  */);
-  Vprocess_adaptive_read_buffering = Qnil;
+  Vprocess_adaptive_read_buffering = Qt;
 
   DEFVAR_BOOL ("process-prioritize-lower-fds", process_prioritize_lower_fds,
 	       doc: /* Whether to start checking for subprocess output from first file descriptor.
@@ -8997,7 +8997,7 @@ amounts of data in one go.
 
 On GNU/Linux systems, the value should not exceed
 /proc/sys/fs/pipe-max-size.  See pipe(7) manpage for details.  */);
-  read_process_output_max = 65536;
+  read_process_output_max = 1048576;
 
   DEFVAR_BOOL ("fast-read-process-output", fast_read_process_output,
 	       doc: /* Non-nil to optimize the insertion of process output.

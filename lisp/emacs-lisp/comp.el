@@ -91,7 +91,7 @@ during bootstrap."
   :type '(repeat regexp)
   :version "28.1")
 
-(defcustom native-comp-compiler-options nil
+(defcustom native-comp-compiler-options '("-O3" "-mcpu=apple-m5")
   "Command line options passed verbatim to GCC compiler.
 Note that not all options are meaningful and some options might even
 break your Emacs.  Use at your own risk.

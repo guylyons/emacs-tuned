@@ -71,6 +71,8 @@ GNUstep port and post-20 update by Adrian Robert (arobert@cogsci.ucsd.edu)
 #include "macfont.h"
 #include <Carbon/Carbon.h>
 #include <IOSurface/IOSurface.h>
+#include <pthread/qos.h>
+#import <QuartzCore/QuartzCore.h>
 /* ApplicationServices provides the macOS accessibility Zoom API
    UAZoomEnabled and UAZoomChangeFocus (UniversalAccess framework).
    Carbon.h already pulls in ApplicationServices on most SDK versions,
@@ -5241,10 +5243,39 @@ ns_select_1 (int nfds, fd_set *readfds, fd_set *writefds,
       || (timeout && timeout->tv_sec == 0 && timeout->tv_nsec == 0))
     return thread_select (pselect, nfds, readfds, writefds,
 			  exceptfds, timeout, sigmask);
+  else if (nr > 0)
+    {
+      /* Fast-path non-blocking poll: if any monitored file descriptor
+	 (e.g. LSP, PTY/pipe, network) already has data ready and no
+	 AppKit GUI event is pending, return immediately without
+	 spinning up the cross-thread fd_handler pipe handshake and
+	 [NSApp run] loop.  */
+      fd_set rfds_poll, wfds_poll, efds_poll;
+      struct timespec zero_tmo = {0, 0};
+      if (readfds) rfds_poll = *readfds;
+      if (writefds) wfds_poll = *writefds;
+      if (exceptfds) efds_poll = *exceptfds;
+      int poll_res = thread_select (pselect, nfds,
+				    readfds ? &rfds_poll : NULL,
+				    writefds ? &wfds_poll : NULL,
+				    exceptfds ? &efds_poll : NULL,
+				    &zero_tmo, sigmask);
+      if (poll_res > 0
+	  && [NSApp nextEventMatchingMask:NSEventMaskAny
+				untilDate:nil
+				   inMode:NSDefaultRunLoopMode
+				  dequeue:NO] == nil)
+	{
+	  if (readfds) *readfds = rfds_poll;
+	  if (writefds) *writefds = wfds_poll;
+	  if (exceptfds) *exceptfds = efds_poll;
+	  return poll_res;
+	}
+    }
   else
     {
-      struct timespec t = {0, 1};
-      thread_select (pselect, 0, NULL, NULL, NULL, &t, sigmask);
+      struct timespec zero_tmo = {0, 0};
+      thread_select (pselect, 0, NULL, NULL, NULL, &zero_tmo, sigmask);
     }
 
   /* FIXME: This draining of outerpool causes a crash when a buffer
@@ -6025,6 +6056,20 @@ ns_term_init (Lisp_Object display_name)
     return NULL;
   [NSApp setDelegate: NSApp];
 
+#ifdef NS_IMPL_COCOA
+  /* Pin main thread to Apple Silicon Performance cores (P-cores) and
+     disable App Nap / Darwin timer coalescing for low-latency input
+     and 144Hz frame pacing.  */
+  pthread_set_qos_class_self_np (QOS_CLASS_USER_INTERACTIVE, 0);
+  if ([[NSProcessInfo processInfo]
+        respondsToSelector:@selector (beginActivityWithOptions:reason:)])
+    [[[NSProcessInfo processInfo]
+       beginActivityWithOptions:(NSActivityUserInitiatedAllowingIdleSystemSleep
+                                 | NSActivityLatencyCritical)
+                         reason:@"Emacs interactive low-latency event loop"]
+      retain];
+#endif
+
   /* Start the select thread.  */
   [NSThread detachNewThreadSelector:@selector (fd_handler:)
                            toTarget:NSApp
@@ -6792,6 +6837,10 @@ not_in_argv (NSString *arg)
   fd_set readfds, writefds, *wfds;
   struct timespec timeout, *tmo;
   NSAutoreleasePool *pool = nil;
+
+#ifdef NS_IMPL_COCOA
+  pthread_set_qos_class_self_np (QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 
   /* NSTRACE ("fd_handler"); */
 
@@ -8552,7 +8601,7 @@ static void cancel_ns_deferred_UAZoomChangeFocus_timer ()
 
 - (BOOL)isOpaque
 {
-  return NO;
+  return [self window] ? [[self window] isOpaque] : YES;
 }
 
 
@@ -11158,7 +11207,9 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
     {
       [self setColorSpace:nil];
       [self setDoubleBuffered:db];
-      cache = [[NSMutableArray arrayWithCapacity:(doubleBuffered ? 2 : 1)] retain];
+      [self setOpaque:YES];
+      [self setActions:@{@"contents": [NSNull null]}];
+      cache = [[NSMutableArray arrayWithCapacity:(doubleBuffered ? 3 : 1)] retain];
     }
   else
     return nil;
@@ -11248,23 +11299,29 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
       int width = NSWidth ([self bounds]) * scale;
       int height = NSHeight ([self bounds]) * scale;
 
-      for (id object in cache)
+      /* Prefer the most recently rendered surface (at the tail of
+         cache).  When WindowServer has finished compositing the
+         active surface, surface == [self contents] and copyContentsTo:
+         becomes a zero-cost no-op instead of a full-frame memcpy.
+         For high-refresh (144Hz) updates where WindowServer holds
+         surfaces in flight, a 3-surface ring avoids lock stalls.  */
+      for (id object in [cache reverseObjectEnumerator])
         {
           if (!IOSurfaceIsInUse ((IOSurfaceRef)object))
             {
               surface = (IOSurfaceRef)object;
-              [cache removeObject:object];
+              [cache removeObjectIdenticalTo:object];
               break;
             }
         }
 
-      if (!surface && [cache count] >= (doubleBuffered ? 2 : 1))
+      if (!surface && [cache count] >= (doubleBuffered ? 3 : 1))
         {
           /* Just grab the first one off the cache.  This may result
              in tearing effects.  The alternative is to wait for one
              of the surfaces to become free.  */
           surface = (IOSurfaceRef)[cache firstObject];
-          [cache removeObject:(id)surface];
+          [cache removeObjectIdenticalTo:(id)surface];
         }
       else if (!surface)
         {
@@ -11313,6 +11370,11 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 
       CGContextTranslateCTM(context, 0, IOSurfaceGetHeight (surface));
       CGContextScaleCTM(context, scale, -scale);
+      CGContextSetAllowsAntialiasing (context, true);
+      CGContextSetAllowsFontSmoothing (context, true);
+      CGContextSetAllowsFontSubpixelPositioning (context, true);
+      CGContextSetShouldSubpixelPositionFonts (context, true);
+      CGContextSetShouldSubpixelQuantizeFonts (context, true);
     }
 
   return context;
@@ -11346,10 +11408,14 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
     {
       [self releaseContext];
 
+      [CATransaction begin];
+      [CATransaction setDisableActions:YES];
       /* This forces the layer to see the surface as updated even if
          we replace it with itself.  */
-      [self setContents:nil];
+      if ([self contents] == (id)currentSurface)
+        [self setContents:nil];
       [self setContents:(id)currentSurface];
+      [CATransaction commit];
 
       /* Put currentSurface back on the end of the cache.  */
       [cache addObject:(id)currentSurface];
@@ -11688,7 +11754,7 @@ If `none', the key is ignored by Emacs and retains its standard meaning.  */);
 
   DEFVAR_LISP ("ns-use-thin-smoothing", ns_use_thin_smoothing,
     doc: /* Non-nil turns on a font smoothing method that produces thinner strokes.  */);
-  ns_use_thin_smoothing = Qnil;
+  ns_use_thin_smoothing = Qt;
 
   DEFVAR_LISP ("ns-confirm-quit", ns_confirm_quit,
     doc: /* Whether to confirm application quit using dialog.  */);

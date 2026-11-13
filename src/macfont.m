@@ -2927,6 +2927,8 @@ macfont_draw (struct glyph_string *s, int from, int to, int x, int y,
   struct macfont_info *macfont_info = (struct macfont_info *) s->font;
   CGRect background_rect;
   CGPoint text_position;
+  CGGlyph stack_glyphs[512];
+  CGPoint stack_positions[512];
   CGGlyph *glyphs;
   CGPoint *positions;
   CGFloat font_size = CTFontGetSize (macfont_info->macfont);
@@ -2948,13 +2950,13 @@ macfont_draw (struct glyph_string *s, int from, int to, int x, int y,
     background_rect = CGRectNull;
 
   text_position = CGPointMake (x, -y);
-  glyphs = xmalloc (sizeof (CGGlyph) * len);
+  glyphs = (len <= 512) ? stack_glyphs : xmalloc (sizeof (CGGlyph) * len);
   {
     CGFloat advance_delta = 0;
     int i;
     CGFloat total_width = 0;
 
-    positions = xmalloc (sizeof (CGPoint) * len);
+    positions = (len <= 512) ? stack_positions : xmalloc (sizeof (CGPoint) * len);
     for (i = 0; i < len; i++)
       {
         int width;
@@ -3048,6 +3050,12 @@ macfont_draw (struct glyph_string *s, int from, int to, int x, int y,
         }
       if (no_antialias_p)
         CGContextSetShouldAntialias (context, false);
+      else
+        {
+          CGContextSetShouldAntialias (context, true);
+          CGContextSetShouldSubpixelPositionFonts (context, true);
+          CGContextSetShouldSubpixelQuantizeFonts (context, true);
+        }
 
       if (!NILP (ns_use_thin_smoothing))
         {
@@ -3081,8 +3089,10 @@ macfont_draw (struct glyph_string *s, int from, int to, int x, int y,
     }
 
 
-  xfree (glyphs);
-  xfree (positions);
+  if (glyphs != stack_glyphs)
+    xfree (glyphs);
+  if (positions != stack_positions)
+    xfree (positions);
   CGContextRestoreGState (context);
 
   unblock_input ();

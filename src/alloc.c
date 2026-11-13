@@ -224,7 +224,7 @@ enum { MALLOC_ALIGNMENT = max (2 * sizeof (size_t), alignof (long double)) };
 
 /* Default value of gc_cons_threshold (see below).  */
 
-#define GC_DEFAULT_THRESHOLD (100000 * word_size)
+#define GC_DEFAULT_THRESHOLD (4000000 * word_size)
 
 /* Global variables.  */
 struct emacs_globals globals;
