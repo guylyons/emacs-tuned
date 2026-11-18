@@ -12618,6 +12618,7 @@ static bool
 svg_load_image (struct frame *f, struct image *img, char *contents,
 		ptrdiff_t size, char *filename)
 {
+  bool keep_alpha = false;
   RsvgHandle *rsvg_handle;
   double viewbox_width, viewbox_height;
   GError *err = NULL;
@@ -12851,7 +12852,8 @@ svg_load_image (struct frame *f, struct image *img, char *contents,
       "style=\"color: #%06X;\" "
       "width=\"%d\" height=\"%d\" preserveAspectRatio=\"none\" "
       "viewBox=\"0 0 %f %f\">"
-      "<rect width=\"100%%\" height=\"100%%\" fill=\"#%06X\"/>"
+      "<rect width=\"100%%\" height=\"100%%\" fill=\"#%06X\" "
+      "fill-opacity=\"%d\"/>"
       "<xi:include href=\"data:image/svg+xml;base64,%s\"></xi:include>"
       "</svg>";
 
@@ -12859,6 +12861,11 @@ svg_load_image (struct frame *f, struct image *img, char *contents,
     if (!NILP (value))
       foreground = image_alloc_image_color (f, img, value, img->face_foreground);
     value = image_spec_value (img->spec, QCbackground, NULL);
+#ifdef HAVE_NS
+    /* Over a translucent `alpha-background', keep the image's own
+       transparency instead of flattening it onto the face colour.  */
+    keep_alpha = NILP (value) && f->alpha_background < 1.0;
+#endif
     if (!NILP (value))
       {
         background = image_alloc_image_color (f, img, value, img->face_background);
@@ -12882,7 +12889,7 @@ svg_load_image (struct frame *f, struct image *img, char *contents,
     wrapped_contents
       = make_formatted_string (wrapper, color, width, height,
 			       viewbox_width, viewbox_height,
-			       fill, SSDATA (encoded_contents));
+			       fill, !keep_alpha, SSDATA (encoded_contents));
   }
 
   /* Now we parse the wrapped version.  */
@@ -12984,10 +12991,15 @@ svg_load_image (struct frame *f, struct image *img, char *contents,
 	    int green   = *pixels++;
 	    int blue    = *pixels++;
 
-            /* Skip opacity.  */
-	    pixels++;
+	    int opacity = *pixels++;
 
 	    PUT_PIXEL (ximg, x, y, lookup_rgb_color (f, red << 8, green << 8, blue << 8));
+#ifdef HAVE_NS
+	    if (keep_alpha)
+	      ns_set_alpha (ximg, x, y, opacity);
+#else
+	    (void) opacity;
+#endif
 	  }
 
 	pixels += rowstride - 4 * width;

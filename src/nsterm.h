@@ -481,6 +481,8 @@ enum ns_return_frame_mode
   int maximized_width, maximized_height;
   EmacsWindow *nonfs_window;
   BOOL fs_is_native;
+  NSImage *backgroundImage;
+  CALayer *backgroundImageLayer;
 @public
   struct frame *emacsframe;
   int scrollbarsNeedingUpdate;
@@ -505,6 +507,8 @@ enum ns_return_frame_mode
 - (void) toggleFullScreen: (id) sender;
 - (BOOL) fsIsNative;
 - (BOOL) isFullscreen;
+- (void) setBackgroundImage: (NSImage *)image;
+- (void) attachBackgroundImage;
 #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
 - (void) updateCollectionBehavior;
 #endif
@@ -1122,6 +1126,10 @@ void ns_dump_glyphstring (struct glyph_string *s) EXTERNALLY_VISIBLE;
 extern Lisp_Object ns_list_fonts (struct frame *f, Lisp_Object pattern,
                                   int size, int maxnames);
 extern void ns_clear_frame (struct frame *f);
+extern void ns_update_alpha_background (struct frame *f);
+#ifdef __OBJC__
+extern NSColor *ns_background_color (struct frame *f, unsigned long pixel);
+#endif
 
 extern void ns_set_offset (struct frame *f, int xoff, int yoff,
                            int change_grav);

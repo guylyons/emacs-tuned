@@ -289,6 +289,58 @@ ns_set_foreground_color (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
 }
 
 
+#ifdef NS_IMPL_COCOA
+/* Show image file NEW_VALUE under F's text, filling the window
+   including its title bar; nil removes it.  The image is only seen
+   where the background is translucent, see `alpha-background'.  */
+static void
+ns_set_background_image (struct frame *f, Lisp_Object new_value,
+                         Lisp_Object old_value)
+{
+  EmacsView *view = FRAME_NS_VIEW (f);
+  NSImage *image = nil;
+
+  if (STRINGP (new_value))
+    {
+      Lisp_Object file = ENCODE_FILE (Fexpand_file_name (new_value, Qnil));
+
+      image = [[[NSImage alloc]
+                 initWithContentsOfFile:
+                   [NSString stringWithUTF8String: SSDATA (file)]]
+                autorelease];
+      if (!image)
+        {
+          store_frame_param (f, Qns_background_image, old_value);
+          error ("Cannot load image %s", SSDATA (new_value));
+        }
+    }
+  else if (!NILP (new_value))
+    wrong_type_argument (Qstringp, new_value);
+
+  if (view)
+    {
+      block_input ();
+      [view setBackgroundImage: image];
+      unblock_input ();
+    }
+}
+#endif
+
+
+static void
+ns_set_alpha_background (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
+{
+  gui_set_alpha_background (f, arg, oldval);
+
+  /* SVG images keep their transparency only over a translucent
+     background, so reload them.  */
+  Lisp_Object frame;
+  XSETFRAME (frame, f);
+  Fclear_image_cache (frame, Qnil);
+  ns_update_alpha_background (f);
+}
+
+
 static void
 ns_set_background_color (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
 {
@@ -314,13 +366,6 @@ ns_set_background_color (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
 
   if (view != nil)
     {
-      [[view window] setBackgroundColor: col];
-
-      if (alpha != (EmacsCGFloat) 1.0)
-          [[view window] setOpaque: NO];
-      else
-          [[view window] setOpaque: YES];
-
       face = FRAME_DEFAULT_FACE (f);
       if (face)
         {
@@ -331,11 +376,8 @@ ns_set_background_color (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
           update_face_from_frame_parameter (f, Qbackground_color, arg);
         }
 
-      if (FRAME_VISIBLE_P (f))
-        {
-          SET_FRAME_GARBAGED (f);
-          ns_clear_frame (f);
-        }
+      /* Sets the window's colour and opacity and redraws.  */
+      ns_update_alpha_background (f);
     }
   unblock_input ();
 }
@@ -1105,12 +1147,13 @@ frame_parm_handler ns_frame_parm_handlers[] =
   ns_set_z_group,
   0, /* x_set_override_redirect */
   gui_set_no_special_glyphs,
-  gui_set_alpha_background,
+  ns_set_alpha_background,
   gui_set_borders_respect_alpha_background,
   NULL,
 #ifdef NS_IMPL_COCOA
   ns_set_appearance,
   ns_set_transparent_titlebar,
+  ns_set_background_image,
 #endif
   NULL,
   NULL,
@@ -1547,6 +1590,10 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame,
                          "alpha", "Alpha", RES_TYPE_NUMBER);
   gui_default_parameter (f, parms, Qalpha_background, Qnil,
                          "alphaBackground", "AlphaBackground", RES_TYPE_NUMBER);
+#ifdef NS_IMPL_COCOA
+  gui_default_parameter (f, parms, Qns_background_image, Qnil,
+                         NULL, NULL, RES_TYPE_STRING);
+#endif
   gui_default_parameter (f, parms, Qborders_respect_alpha_background, Qnil,
                          "bordersRespectAlphaBackground",
                          "BordersRespectAlphaBackground", RES_TYPE_NUMBER);

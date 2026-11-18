@@ -4159,6 +4159,7 @@ static const struct frame_parm_table frame_parms[] =
 #ifdef NS_IMPL_COCOA
   {"ns-appearance",		SYMBOL_INDEX (Qns_appearance)},
   {"ns-transparent-titlebar",	SYMBOL_INDEX (Qns_transparent_titlebar)},
+  {"ns-background-image",	SYMBOL_INDEX (Qns_background_image)},
 #endif
 
   {"display",			SYMBOL_INDEX (Qdisplay)},
@@ -4236,6 +4237,7 @@ enum x_frame_parameter
 #ifdef NS_IMPL_COCOA
   NS_APPEARANCE,
   NS_TRANSPARENT_TITLEBAR,
+  NS_BACKGROUND_IMAGE,
 #endif
   DISPLAY,
   LEFT,
@@ -7709,6 +7711,7 @@ syms_of_frame (void)
 #ifdef NS_IMPL_COCOA
   DEFSYM (Qns_appearance, "ns-appearance");
   DEFSYM (Qns_transparent_titlebar, "ns-transparent-titlebar");
+  DEFSYM (Qns_background_image, "ns-background-image");
 #endif
 
   DEFSYM (Qalpha, "alpha");

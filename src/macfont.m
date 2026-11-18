@@ -2998,8 +2998,18 @@ macfont_draw (struct glyph_string *s, int from, int to, int x, int y,
             CG_SET_FILL_COLOR_WITH_FRAME_CURSOR (context, f);
         }
       else
-        CG_SET_FILL_COLOR_WITH_FACE_BACKGROUND (context, face);
+        {
+          /* Translucent with `alpha-background'; copy rather than
+             blend, or it would stack on the cleared background.  */
+          CGColorRef refcol
+            = get_cgcolor_from_nscolor
+                (ns_background_color (f, NS_FACE_BACKGROUND (face)), f);
+          CGContextSetFillColorWithColor (context, refcol);
+          CGColorRelease (refcol);
+          CGContextSetBlendMode (context, kCGBlendModeCopy);
+        }
       CGContextFillRects (context, &background_rect, 1);
+      CGContextSetBlendMode (context, kCGBlendModeNormal);
     }
 
   if (macfont_info->cgfont)
