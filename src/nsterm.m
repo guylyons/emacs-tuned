@@ -7513,7 +7513,6 @@ glitch_random (void)
                      u.size[1] / [texture height]);
   u.scale[0] = u.size[0] / ([texture width] * fill);
   u.scale[1] = u.size[1] / ([texture height] * fill);
-  [self setHidden: YES size: CGSizeMake (u.size[0], u.size[1])];
 
   BOOL hard = glitch_random () < hardChance;
   double len = hard ? 0.3 + glitch_random () * 0.9 : 1.8 + glitch_random () * 1.8;
