@@ -7380,7 +7380,8 @@ case "$opsys" in
      libs_nsgui="-framework AppKit"
      if test "$NS_IMPL_COCOA" = "yes"; then
         libs_nsgui="$libs_nsgui -framework IOKit -framework Carbon \
-                    -framework IOSurface -framework QuartzCore"
+                    -framework IOSurface -framework QuartzCore \
+                    -framework Metal"
         if test "$emacs_cv_macosx_12_0" = "yes"; then
 	  libs_nsgui="$libs_nsgui -framework UniformTypeIdentifiers"
 	fi

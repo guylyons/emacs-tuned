@@ -324,6 +324,40 @@ ns_set_background_image (struct frame *f, Lisp_Object new_value,
       unblock_input ();
     }
 }
+
+
+/* Make F's `ns-background-image' glitch now and then if NEW_VALUE is
+   non-nil.  NEW_VALUE may be a plist: :interval is the mean seconds
+   between bursts (default 11), :intensity a percentage of the designed
+   strength (default 100, up to 200), and :style `drift', `hard' or
+   `both' (the default).  */
+static void
+ns_set_background_glitch (struct frame *f, Lisp_Object new_value,
+                          Lisp_Object old_value)
+{
+  EmacsView *view = FRAME_NS_VIEW (f);
+  double interval = NILP (new_value) ? 0 : 11, intensity = 100, hard = 0.55;
+
+  if (CONSP (new_value))
+    {
+      Lisp_Object v = plist_get (new_value, QCinterval);
+      if (NUMBERP (v) && XFLOATINT (v) >= 1)
+        interval = XFLOATINT (v);
+      v = plist_get (new_value, QCintensity);
+      if (NUMBERP (v))
+        intensity = fmax (0, fmin (XFLOATINT (v), 200));
+      v = plist_get (new_value, QCstyle);
+      hard = EQ (v, Qdrift) ? 0 : EQ (v, Qhard) ? 1 : hard;
+    }
+
+  if (view)
+    {
+      block_input ();
+      [view setBackgroundGlitch: interval intensity: intensity / 100
+                           hard: hard];
+      unblock_input ();
+    }
+}
 #endif
 
 
@@ -1154,6 +1188,7 @@ frame_parm_handler ns_frame_parm_handlers[] =
   ns_set_appearance,
   ns_set_transparent_titlebar,
   ns_set_background_image,
+  ns_set_background_glitch,
 #endif
   NULL,
   NULL,
@@ -1593,6 +1628,8 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame,
 #ifdef NS_IMPL_COCOA
   gui_default_parameter (f, parms, Qns_background_image, Qnil,
                          NULL, NULL, RES_TYPE_STRING);
+  gui_default_parameter (f, parms, Qns_background_glitch, Qnil,
+                         NULL, NULL, RES_TYPE_BOOLEAN);
 #endif
   gui_default_parameter (f, parms, Qborders_respect_alpha_background, Qnil,
                          "bordersRespectAlphaBackground",
@@ -4264,6 +4301,10 @@ syms_of_nsfns (void)
   DEFSYM (Qframe_title_format, "frame-title-format");
   DEFSYM (Qicon_title_format, "icon-title-format");
   DEFSYM (Qdark, "dark");
+  DEFSYM (QCinterval, ":interval");
+  DEFSYM (QCintensity, ":intensity");
+  DEFSYM (Qdrift, "drift");
+  DEFSYM (Qhard, "hard");
   DEFSYM (Qlight, "light");
 
   DEFVAR_LISP ("ns-icon-type-alist", Vns_icon_type_alist,

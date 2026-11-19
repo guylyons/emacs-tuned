@@ -73,6 +73,8 @@ GNUstep port and post-20 update by Adrian Robert (arobert@cogsci.ucsd.edu)
 #include <IOSurface/IOSurface.h>
 #include <pthread/qos.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Metal/Metal.h>
+#include <stdatomic.h>
 /* ApplicationServices provides the macOS accessibility Zoom API
    UAZoomEnabled and UAZoomChangeFocus (UniversalAccess framework).
    Carbon.h already pulls in ApplicationServices on most SDK versions,
@@ -7127,6 +7129,447 @@ ns_create_font_panel_buttons (id target, SEL select, SEL cancel_action)
 }
 #endif
 
+
+#ifdef NS_IMPL_COCOA
+/* ==========================================================================
+
+    Background image glitch (`ns-background-glitch')
+
+   ========================================================================== */
+
+/* Every so often the background image breathes out of focus, or breaks
+   up like a damaged video stream and then hunts back into focus.  A
+   Metal layer over the static image draws only during these bursts, on
+   its own thread, so a busy Emacs neither stalls it nor pays for it in
+   between.  */
+
+static const char glitch_shader[] =
+  "#include <metal_stdlib>\n"
+  "using namespace metal;\n"
+  "struct V { float4 pos [[position]]; float2 uv; };\n"
+  "struct U { float2 size, scale;\n"
+  "           float time, seed, focus, split, tear, blocks, noise, pad; };\n"
+  "static float hash (float a, float b, float c)\n"
+  "{\n"
+  "  uint3 v = uint3 (int3 (float3 (a, b, c))) * 1664525u + 1013904223u;\n"
+  "  v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;\n"
+  "  v ^= v >> 16u;\n"
+  "  v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;\n"
+  "  return float (v.x) / 4294967296.0;\n"
+  "}\n"
+  "vertex V vmain (uint id [[vertex_id]])\n"
+  "{\n"
+  "  float2 p = float2 ((id << 1) & 2, id & 2);\n"
+  "  V v;\n"
+  "  v.pos = float4 (p * 2.0 - 1.0, 0.0, 1.0);\n"
+  "  v.uv = float2 (p.x, 1.0 - p.y);\n"
+  "  return v;\n"
+  "}\n"
+  "fragment float4 fmain (V in [[stage_in]], constant U &u [[buffer (0)]],\n"
+  "                       texture2d<float> tex [[texture (0)]])\n"
+  "{\n"
+  "  constexpr sampler s (filter::linear, mip_filter::linear,\n"
+  "                       s_address::repeat, t_address::clamp_to_edge);\n"
+  "  float2 px = in.uv * u.size, uv = in.uv;\n"
+  /* Tearing: bands of rows slide sideways, plus the odd hairline.  */
+  "  float band = floor (uv.y * mix (6.0, 40.0, hash (u.seed, 1, 0))\n"
+  "                      + hash (u.seed, 2, 0));\n"
+  "  if (hash (band, u.seed, 3) < u.tear * 0.4)\n"
+  "    uv.x += (hash (band, u.seed, 4) - 0.5) * 0.2 * u.tear;\n"
+  "  float line = floor (px.y / 3.0);\n"
+  "  if (hash (line, u.seed, 5) < u.tear * 0.03)\n"
+  "    uv.x += (hash (line, u.seed, 6) - 0.5) * 0.5;\n"
+  /* A damaged stream: from some row down the picture slips and its
+     channels swap, and scattered macroblocks show the wrong part of
+     the picture, some decoded as coarse 8px cells.  */
+  "  bool slip = in.uv.y > hash (u.seed, 7, 0)\n"
+  "              && hash (u.seed, 8, 0) < u.blocks * 0.6;\n"
+  "  if (slip)\n"
+  "    uv.x += (hash (u.seed, 9, 0) - 0.5) * 0.3;\n"
+  "  float2 blk = floor (px / floor (mix (16.0, 64.0, hash (u.seed, 10, 0))));\n"
+  "  float br = hash (blk.x, blk.y, u.seed);\n"
+  "  bool corrupt = br < u.blocks * 0.15;\n"
+  "  if (corrupt)\n"
+  "    {\n"
+  "      uv += (float2 (hash (blk.x, blk.y, u.seed + 1),\n"
+  "                     hash (blk.x, blk.y, u.seed + 2)) - 0.5) * 0.4;\n"
+  "      if (br < u.blocks * 0.07)\n"
+  "        uv = (floor (uv * u.size / 8.0) + 0.5) * 8.0 / u.size;\n"
+  "    }\n"
+  /* Defocus and chromatic split.  SCALE maps the window onto the
+     image as `kCAGravityResizeAspectFill' does.  */
+  "  float2 tuv = (uv - 0.5) * u.scale + 0.5, texel = u.scale / u.size;\n"
+  "  float2 ca = (float2 (1.0, 0.2) * 12.0 * texel\n"
+  "               + (uv - 0.5) * 0.015 * u.scale) * u.split;\n"
+  "  float radius = u.focus * 16.0;\n"
+  "  float3 c = 0.0;\n"
+  "  float a = 0.0;\n"
+  "  if (radius < 0.5)\n"
+  "    {\n"
+  "      float4 g = tex.sample (s, tuv);\n"
+  "      c = float3 (tex.sample (s, tuv + ca).r, g.g, tex.sample (s, tuv - ca).b);\n"
+  "      a = g.a;\n"
+  "    }\n"
+  "  else\n"
+  "    {\n"
+  /* A golden-angle disc of taps, turned per pixel so the gaps between
+     them dither into grain; blurrier mip levels fill them in.
+     Highlights weigh more, blooming into bokeh.  */
+  "      float lod = log2 (radius / 4.0 + 1.0), w = 0.0;\n"
+  "      float rot = hash (px.x, px.y, 11) * 6.2832;\n"
+  "      for (int i = 0; i < 16; i++)\n"
+  "        {\n"
+  "          float th = i * 2.39996 + rot;\n"
+  "          float2 o = float2 (cos (th), sin (th))\n"
+  "                     * sqrt ((i + 0.5) / 16.0) * radius * texel;\n"
+  "          float4 g = tex.sample (s, tuv + o, bias (lod));\n"
+  "          float3 t = float3 (tex.sample (s, tuv + o + ca, bias (lod)).r, g.g,\n"
+  "                             tex.sample (s, tuv + o - ca, bias (lod)).b);\n"
+  "          float k = 1.0 + pow (dot (t, float3 (0.299, 0.587, 0.114)), 4.0)\n"
+  "                          * 6.0 * u.focus;\n"
+  "          c += t * k;\n"
+  "          a += g.a * k;\n"
+  "          w += k;\n"
+  "        }\n"
+  "      c /= w;\n"
+  "      a /= w;\n"
+  "    }\n"
+  "  if (corrupt && br < u.blocks * 0.1)\n"
+  "    c = floor (c * 4.0 + 0.5) / 4.0;\n"
+  "  if (corrupt && br < u.blocks * 0.04)\n"
+  "    c = c.gbr;\n"
+  "  if (slip)\n"
+  "    c = c.bgr;\n"
+  /* Scanlines and film grain.  */
+  "  c *= 1.0 - u.noise * (fmod (floor (px.y), 3.0) < 1.0 ? 0.1 : 0.0);\n"
+  "  c += (hash (px.x, px.y, floor (u.time * 60.0)) - 0.5) * u.noise * 0.1;\n"
+  "  return float4 (clamp (c, 0.0, a), a);\n"
+  "}\n";
+
+/* The shader's U.  */
+typedef struct
+{
+  float size[2], scale[2];
+  float time, seed, focus, split, tear, blocks, noise, pad;
+} GlitchUniforms;
+
+static double
+glitch_random (void)
+{
+  return arc4random () / 4294967296.0;
+}
+
+@interface EmacsGlitch : NSObject
+{
+  NSImage *image;
+  CGImageRef cgimage;
+  CGColorSpaceRef colorspace;
+  CAMetalLayer *layer;
+  id<MTLCommandQueue> queue;
+  id<MTLRenderPipelineState> pipeline;
+  id<MTLTexture> texture;
+  atomic_bool stopped;
+  double interval, intensity, hardChance;
+}
+@end
+
+@implementation EmacsGlitch
+
+/* INTERVAL is the mean number of seconds between bursts, INTENSITY
+   scales every effect (1 is the designed look) and HARD is the
+   chance a burst is a hard glitch rather than a drift.  */
+- (instancetype)initWithImage: (NSImage *)img interval: (double)secs
+                    intensity: (double)scale hard: (double)chance
+{
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice ();
+  CGImageRef cg = [img CGImageForProposedRect: NULL context: nil hints: nil];
+  CGColorSpaceRef cs = cg ? CGImageGetColorSpace (cg) : NULL;
+
+  if (!(self = [super init]) || !device || !cg)
+    {
+      [device release];
+      [self release];
+      return nil;
+    }
+
+  image = [img retain];
+  interval = secs;
+  intensity = scale;
+  hardChance = chance;
+  cgimage = CGImageRetain (cg);
+  /* Match the static image's colours exactly.  */
+  colorspace = (cs && CGColorSpaceGetModel (cs) == kCGColorSpaceModelRGB
+                ? CGColorSpaceRetain (cs)
+                : CGColorSpaceCreateWithName (kCGColorSpaceSRGB));
+  layer = [[CAMetalLayer alloc] init];
+  [layer setDevice: device];
+  [device release];
+  [layer setPixelFormat: MTLPixelFormatBGRA8Unorm];
+  [layer setColorspace: colorspace];
+  [layer setOpaque: NO];
+  [layer setHidden: YES];
+  [layer setAutoresizingMask: kCALayerWidthSizable | kCALayerHeightSizable];
+  [NSThread detachNewThreadSelector: @selector (run)
+                           toTarget: self
+                         withObject: nil];
+  return self;
+}
+
+- (NSImage *)image
+{
+  return image;
+}
+
+- (CALayer *)layer
+{
+  return layer;
+}
+
+/* The thread exits soon after, releasing its hold on this object.  */
+- (void)stop
+{
+  atomic_store (&stopped, true);
+  [layer removeFromSuperlayer];
+}
+
+- (void)dealloc
+{
+  [texture release];
+  [pipeline release];
+  [queue release];
+  [layer release];
+  CGColorSpaceRelease (colorspace);
+  CGImageRelease (cgimage);
+  [image release];
+  [super dealloc];
+}
+
+/* Compile the shader and upload the image, with mipmaps for the blur.  */
+- (BOOL)setUp
+{
+  id<MTLDevice> device = [layer device];
+  NSError *err = nil;
+  id<MTLLibrary> lib = [device newLibraryWithSource:
+                                 [NSString stringWithUTF8String: glitch_shader]
+                                            options: nil
+                                              error: &err];
+  if (!lib)
+    {
+      NSLog (@"ns-background-glitch: %@", err);
+      return NO;
+    }
+
+  MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+  id<MTLFunction> vf = [lib newFunctionWithName: @"vmain"];
+  id<MTLFunction> ff = [lib newFunctionWithName: @"fmain"];
+  [desc setVertexFunction: vf];
+  [desc setFragmentFunction: ff];
+  [[desc colorAttachments][0] setPixelFormat: [layer pixelFormat]];
+  pipeline = [device newRenderPipelineStateWithDescriptor: desc error: &err];
+  [desc release];
+  [vf release];
+  [ff release];
+  [lib release];
+  if (!pipeline)
+    {
+      NSLog (@"ns-background-glitch: %@", err);
+      return NO;
+    }
+  queue = [device newCommandQueue];
+
+  size_t w = CGImageGetWidth (cgimage), h = CGImageGetHeight (cgimage);
+  double k = MIN (1.0, 8192.0 / MAX (w, h));
+  w = MAX (1, w * k);
+  h = MAX (1, h * k);
+  CGContextRef ctx = CGBitmapContextCreate (NULL, w, h, 8, 0, colorspace,
+                                            kCGImageAlphaPremultipliedFirst
+                                            | kCGBitmapByteOrder32Little);
+  if (!ctx)
+    return NO;
+  CGContextSetInterpolationQuality (ctx, kCGInterpolationHigh);
+  CGContextDrawImage (ctx, CGRectMake (0, 0, w, h), cgimage);
+
+  MTLTextureDescriptor *td
+    = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat: MTLPixelFormatBGRA8Unorm
+                                     width: w
+                                    height: h
+                                 mipmapped: YES];
+  texture = [device newTextureWithDescriptor: td];
+  [texture replaceRegion: MTLRegionMake2D (0, 0, w, h)
+             mipmapLevel: 0
+               withBytes: CGBitmapContextGetData (ctx)
+             bytesPerRow: CGBitmapContextGetBytesPerRow (ctx)];
+  CGContextRelease (ctx);
+
+  id<MTLCommandBuffer> cb = [queue commandBuffer];
+  id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+  [blit generateMipmapsForTexture: texture];
+  [blit endEncoding];
+  [cb commit];
+  return YES;
+}
+
+- (void)run
+{
+  @autoreleasepool
+    {
+      if (![self setUp])
+        return;
+    }
+
+  while (!atomic_load (&stopped))
+    @autoreleasepool
+      {
+        /* Long quiet spells keep it rare enough to land.  */
+        for (double rest = interval * (0.45 + glitch_random () * 1.1);
+             rest > 0 && !atomic_load (&stopped); rest -= 0.1)
+          [NSThread sleepForTimeInterval: 0.1];
+
+        if (!atomic_load (&stopped)
+            && ![[NSWorkspace sharedWorkspace]
+                  accessibilityDisplayShouldReduceMotion])
+          [self burst];
+      }
+}
+
+/* Off the main thread there is no run loop to commit implicit
+   transactions, so change the layer in an explicit one.  */
+- (void)setHidden: (BOOL)hidden size: (CGSize)size
+{
+  [CATransaction begin];
+  [CATransaction setDisableActions: YES];
+  if (size.width > 0)
+    [layer setDrawableSize: size];
+  [layer setHidden: hidden];
+  [CATransaction commit];
+}
+
+- (void)render: (GlitchUniforms *)u wait: (BOOL)wait
+{
+  @autoreleasepool
+    {
+      id<CAMetalDrawable> drawable = [layer nextDrawable];
+      GlitchUniforms v = *u;
+
+      if (!drawable)
+        return;
+      v.focus *= intensity;
+      v.split *= intensity;
+      v.tear *= intensity;
+      v.blocks *= intensity;
+      v.noise *= intensity;
+
+      MTLRenderPassDescriptor *pass
+        = [MTLRenderPassDescriptor renderPassDescriptor];
+      [[pass colorAttachments][0] setTexture: [drawable texture]];
+      [[pass colorAttachments][0] setLoadAction: MTLLoadActionDontCare];
+      [[pass colorAttachments][0] setStoreAction: MTLStoreActionStore];
+
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLRenderCommandEncoder> enc
+        = [cb renderCommandEncoderWithDescriptor: pass];
+      [enc setRenderPipelineState: pipeline];
+      [enc setFragmentBytes: &v length: sizeof v atIndex: 0];
+      [enc setFragmentTexture: texture atIndex: 0];
+      [enc drawPrimitives: MTLPrimitiveTypeTriangle vertexStart: 0
+              vertexCount: 3];
+      [enc endEncoding];
+      [cb presentDrawable: drawable];
+      [cb commit];
+      if (wait)
+        [cb waitUntilScheduled];
+    }
+}
+
+/* One event: a drift out of focus and back, or a hard glitch whose
+   broken frames hold and jump like a failing decoder's, after which
+   the lens hunts back into focus.  */
+- (void)burst
+{
+  CGSize size = [layer bounds].size;
+  CGFloat sc = [layer contentsScale];
+  GlitchUniforms u = { { size.width * sc, size.height * sc } };
+
+  if (u.size[0] < 1 || u.size[1] < 1)
+    return;
+  double fill = MAX (u.size[0] / [texture width],
+                     u.size[1] / [texture height]);
+  u.scale[0] = u.size[0] / ([texture width] * fill);
+  u.scale[1] = u.size[1] / ([texture height] * fill);
+  [self setHidden: YES size: CGSizeMake (u.size[0], u.size[1])];
+
+  BOOL hard = glitch_random () < hardChance;
+  double len = hard ? 0.3 + glitch_random () * 0.9 : 1.8 + glitch_random () * 1.8;
+  double settle = hard ? 0.7 : 0;
+  double depth = 0.5 + glitch_random () * 0.5;
+  /* A drift sometimes cracks for a few frames at its softest.  */
+  double flick = (!hard && glitch_random () < 0.4
+                  ? len * (0.35 + glitch_random () * 0.3) : -1);
+  float flick_seed = arc4random_uniform (65536);
+  double start = CACurrentMediaTime (), hold = 0;
+  BOOL shown = NO;
+
+  for (double t = 0; t < len + settle && !atomic_load (&stopped);
+       t = CACurrentMediaTime () - start)
+    {
+      u.time = t;
+      if (hard && t < len)
+        {
+          double e = sqrt (sin (M_PI * t / len));
+
+          if (t >= hold)
+            {
+              BOOL clean = glitch_random () < 0.25;
+
+              hold = t + (1 + arc4random_uniform (5)) / 60.0;
+              u.seed = arc4random_uniform (65536);
+              u.tear = clean ? 0 : e * glitch_random ();
+              u.blocks = clean || glitch_random () < 0.4 ? 0 : e * glitch_random ();
+              u.split = e * (clean ? 0.15 : 0.3 + 0.7 * glitch_random ());
+              /* Now and then the lens loses the picture for a frame.  */
+              u.focus = glitch_random () < 0.15 ? e * 0.6 : 0;
+            }
+          u.noise = e;
+        }
+      else if (hard)
+        {
+          double x = (t - len) / settle;
+
+          u.tear = u.blocks = 0;
+          u.focus = 0.7 * sin (M_PI * x) * (1 - x);
+          u.split = u.focus * 0.5;
+          u.noise = 0.4 * (1 - x);
+        }
+      else
+        {
+          double s = sin (M_PI * t / len);
+          BOOL crack = flick >= 0 && fabs (t - flick) < 0.05;
+
+          u.focus = depth * s * s;
+          u.split = crack ? 1 : 0.35 * s * s;
+          u.noise = 0.4 * s * s;
+          u.tear = crack ? 0.7 : 0;
+          u.blocks = crack ? 0.5 : 0;
+          u.seed = flick_seed;
+        }
+
+      [self render: &u wait: !shown];
+      if (!shown)
+        [self setHidden: NO size: CGSizeZero];
+      shown = YES;
+      [NSThread sleepForTimeInterval: 1.0 / 60];
+    }
+
+  /* End on the clean image, identical to the layer below.  */
+  u.focus = u.split = u.tear = u.blocks = u.noise = 0;
+  [self render: &u wait: YES];
+  [self setHidden: YES size: CGSizeZero];
+}
+
+@end
+#endif
+
 /* ==========================================================================
 
     EmacsView implementation
@@ -7160,6 +7603,15 @@ ns_create_font_panel_buttons (id target, SEL select, SEL cancel_action)
   NSView *content = [[self window] contentView];
   CALayer *frameLayer = [[content superview] layer];
 
+  if (backgroundGlitch
+      && (!glitchInterval || !frameLayer
+          || [backgroundGlitch image] != backgroundImage))
+    {
+      [backgroundGlitch stop];
+      [backgroundGlitch release];
+      backgroundGlitch = nil;
+    }
+
   if (!backgroundImage || !frameLayer)
     {
       [backgroundImageLayer removeFromSuperlayer];
@@ -7179,7 +7631,7 @@ ns_create_font_panel_buttons (id target, SEL select, SEL cancel_action)
 
   CGRect bounds = [frameLayer bounds];
   CGFloat top = NSMaxY ([content frame]);
-  CALayer *tint = [[backgroundImageLayer sublayers] firstObject];
+  CALayer *tint = [[backgroundImageLayer sublayers] lastObject];
 
   [backgroundImageLayer setContents: backgroundImage];
   [backgroundImageLayer setFrame: bounds];
@@ -7195,6 +7647,22 @@ ns_create_font_panel_buttons (id target, SEL select, SEL cancel_action)
   [tint setFrame: CGRectMake (0, top, bounds.size.width,
                               MAX (0, bounds.size.height - top))];
   [tint setBackgroundColor: [[[self window] backgroundColor] CGColor]];
+
+  /* The glitch layer sits between the image and the tint.  */
+  if (glitchInterval && !backgroundGlitch)
+    backgroundGlitch = [[EmacsGlitch alloc] initWithImage: backgroundImage
+                                                 interval: glitchInterval
+                                                intensity: glitchIntensity
+                                                     hard: glitchHard];
+  if (backgroundGlitch)
+    {
+      CALayer *glitch = [backgroundGlitch layer];
+
+      [glitch setFrame: [backgroundImageLayer bounds]];
+      [glitch setContentsScale: [[self window] backingScaleFactor]];
+      if ([glitch superlayer] != backgroundImageLayer)
+        [backgroundImageLayer insertSublayer: glitch atIndex: 0];
+    }
 }
 
 
@@ -7203,6 +7671,20 @@ ns_create_font_panel_buttons (id target, SEL select, SEL cancel_action)
   [image retain];
   [backgroundImage release];
   backgroundImage = image;
+  [self attachBackgroundImage];
+}
+
+
+- (void)setBackgroundGlitch: (double)interval intensity: (double)intensity
+                        hard: (double)hard
+{
+  glitchInterval = interval;
+  glitchIntensity = intensity;
+  glitchHard = hard;
+  /* The renderer takes its settings once, so start a new one.  */
+  [backgroundGlitch stop];
+  [backgroundGlitch release];
+  backgroundGlitch = nil;
   [self attachBackgroundImage];
 }
 
@@ -7228,6 +7710,8 @@ ns_create_font_panel_buttons (id target, SEL select, SEL cancel_action)
   if (fs_state == FULLSCREEN_BOTH)
     [nonfs_window release];
 
+  [backgroundGlitch stop];
+  [backgroundGlitch release];
   [backgroundImageLayer removeFromSuperlayer];
   [backgroundImageLayer release];
   [backgroundImage release];

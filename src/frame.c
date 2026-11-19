@@ -4160,6 +4160,7 @@ static const struct frame_parm_table frame_parms[] =
   {"ns-appearance",		SYMBOL_INDEX (Qns_appearance)},
   {"ns-transparent-titlebar",	SYMBOL_INDEX (Qns_transparent_titlebar)},
   {"ns-background-image",	SYMBOL_INDEX (Qns_background_image)},
+  {"ns-background-glitch",	SYMBOL_INDEX (Qns_background_glitch)},
 #endif
 
   {"display",			SYMBOL_INDEX (Qdisplay)},
@@ -4238,6 +4239,7 @@ enum x_frame_parameter
   NS_APPEARANCE,
   NS_TRANSPARENT_TITLEBAR,
   NS_BACKGROUND_IMAGE,
+  NS_BACKGROUND_GLITCH,
 #endif
   DISPLAY,
   LEFT,
@@ -7712,6 +7714,7 @@ syms_of_frame (void)
   DEFSYM (Qns_appearance, "ns-appearance");
   DEFSYM (Qns_transparent_titlebar, "ns-transparent-titlebar");
   DEFSYM (Qns_background_image, "ns-background-image");
+  DEFSYM (Qns_background_glitch, "ns-background-glitch");
 #endif
 
   DEFSYM (Qalpha, "alpha");
