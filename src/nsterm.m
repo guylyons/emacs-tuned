@@ -7270,6 +7270,7 @@ glitch_random (void)
   id<MTLTexture> texture;
   atomic_bool stopped;
   double interval, intensity, hardChance;
+  CGSize drawableSize;
 }
 @end
 
@@ -7433,15 +7434,28 @@ glitch_random (void)
       }
 }
 
-/* Off the main thread there is no run loop to commit implicit
-   transactions, so change the layer in an explicit one.  */
-- (void)setHidden: (BOOL)hidden size: (CGSize)size
+/* The layer lives in the window's tree, so only the main thread may
+   touch it: a commit from the render thread races AppKit's layout and
+   corrupts the tree.  These run there via performSelectorOnMainThread.  */
+- (void)fitDrawable
+{
+  CGFloat sc = [layer contentsScale];
+  CGSize s = [layer bounds].size;
+
+  drawableSize = CGSizeMake (s.width * sc, s.height * sc);
+  [CATransaction begin];
+  [CATransaction setDisableActions: YES];
+  if (drawableSize.width >= 1 && drawableSize.height >= 1)
+    [layer setDrawableSize: drawableSize];
+  [layer setHidden: YES];
+  [CATransaction commit];
+}
+
+- (void)setLayerHidden: (NSNumber *)hidden
 {
   [CATransaction begin];
   [CATransaction setDisableActions: YES];
-  if (size.width > 0)
-    [layer setDrawableSize: size];
-  [layer setHidden: hidden];
+  [layer setHidden: [hidden boolValue]];
   [CATransaction commit];
 }
 
@@ -7487,9 +7501,11 @@ glitch_random (void)
    the lens hunts back into focus.  */
 - (void)burst
 {
-  CGSize size = [layer bounds].size;
-  CGFloat sc = [layer contentsScale];
-  GlitchUniforms u = { { size.width * sc, size.height * sc } };
+  [self performSelectorOnMainThread: @selector (fitDrawable)
+                         withObject: nil
+                      waitUntilDone: YES];
+
+  GlitchUniforms u = { { drawableSize.width, drawableSize.height } };
 
   if (u.size[0] < 1 || u.size[1] < 1)
     return;
@@ -7556,7 +7572,9 @@ glitch_random (void)
 
       [self render: &u wait: !shown];
       if (!shown)
-        [self setHidden: NO size: CGSizeZero];
+        [self performSelectorOnMainThread: @selector (setLayerHidden:)
+                               withObject: [NSNumber numberWithBool: NO]
+                            waitUntilDone: NO];
       shown = YES;
       [NSThread sleepForTimeInterval: 1.0 / 60];
     }
@@ -7564,7 +7582,9 @@ glitch_random (void)
   /* End on the clean image, identical to the layer below.  */
   u.focus = u.split = u.tear = u.blocks = u.noise = 0;
   [self render: &u wait: YES];
-  [self setHidden: YES size: CGSizeZero];
+  [self performSelectorOnMainThread: @selector (setLayerHidden:)
+                         withObject: [NSNumber numberWithBool: YES]
+                      waitUntilDone: NO];
 }
 
 @end
