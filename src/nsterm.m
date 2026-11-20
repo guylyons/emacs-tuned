@@ -1272,6 +1272,14 @@ ns_focus (struct frame *f, NSRect *r, int n)
       [view lockFocus];
     }
 
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+  /* Nothing can be drawn outside the clip, so it is the damage.  */
+  EmacsLayer *layer = (EmacsLayer *) [FRAME_NS_VIEW (f) layer];
+  [layer damageRect: r ? r[0] : [FRAME_NS_VIEW (f) bounds]];
+  if (r && n == 2)
+    [layer damageRect: r[1]];
+#endif
+
   /* clipping */
   if (r)
     {
@@ -3444,7 +3452,7 @@ ns_draw_window_cursor (struct window *w, struct glyph_row *glyph_row,
     ns_UAZoom_cursor_rect_new = r;
 #endif
 
-  ns_focus (f, NULL, 0);
+  ns_focus (f, &r, 1);
 
   NSGraphicsContext *ctx = [NSGraphicsContext currentContext];
   [ctx saveGraphicsState];
@@ -4977,9 +4985,12 @@ ns_draw_glyph_string (struct glyph_string *s)
   ns_unfocus (s->f);
 
   /* Draw surrounding overhangs. */
+  /* The overhangs are drawn clipped to S's own area.  */
+  NSRect sr = NSMakeRect (s->x, s->y, s->width, s->height);
+
   if (s->prev)
     {
-      ns_focus (s->f, NULL, 0);
+      ns_focus (s->f, &sr, 1);
       struct glyph_string *prev;
 
       for (prev = s->prev; prev; prev = prev->prev)
@@ -5020,7 +5031,7 @@ ns_draw_glyph_string (struct glyph_string *s)
 
   if (s->next)
     {
-      ns_focus (s->f, NULL, 0);
+      ns_focus (s->f, &sr, 1);
       struct glyph_string *next;
 
       for (next = s->next; next; next = next->next)
@@ -10461,6 +10472,7 @@ static void cancel_ns_deferred_UAZoomChangeFocus_timer ()
 #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
   CGContextRef context = [(EmacsLayer *)[self layer] getContext];
   CGContextFlush (context);
+  [(EmacsLayer *)[self layer] damageRect: dstRect];
 
   double scale = [[self window] backingScaleFactor];
   int bpp = CGBitmapContextGetBitsPerPixel (context) / 8;
@@ -12319,6 +12331,28 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 
       [cache removeAllObjects];
     }
+
+  memset (stale, 0, sizeof stale);
+  damage = 0;
+}
+
+
+/* Note that RECT, in the view's coordinates, is about to be drawn
+   to.  */
+- (void) damageRect: (NSRect)rect
+{
+  if (!currentSurface)
+    return;
+
+  CGFloat scale = [self contentsScale];
+  int height = IOSurfaceGetHeight (currentSurface);
+  int rows = (height + 63) / 64;
+  int top = floor (fmax (0, NSMinY (rect) * scale));
+  int bottom = ceil (fmin (height, NSMaxY (rect) * scale));
+
+  if (top < bottom)
+    for (int band = top / rows; band <= (bottom - 1) / rows; band++)
+      damage |= 1ULL << band;
 }
 
 
@@ -12350,6 +12384,8 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
   if (!context)
     {
       IOSurfaceRef surface = NULL;
+      /* A surface that is not in STALE has nothing of use in it.  */
+      uint64_t bands = ~0ULL;
       int width = NSWidth ([self bounds]) * scale;
       int height = NSHeight ([self bounds]) * scale;
 
@@ -12396,11 +12432,18 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
           return nil;
         }
 
+      for (int i = 0; i < 3; i++)
+        if (stale[i].surface == surface)
+          {
+            bands = stale[i].bands;
+            stale[i].surface = NULL;
+          }
+
       IOReturn lockStatus = IOSurfaceLock (surface, 0, nil);
       if (lockStatus != kIOReturnSuccess)
         NSLog (@"Failed to lock surface: %x", (unsigned int)lockStatus);
 
-      [self copyContentsTo:surface];
+      [self copyContentsTo:surface bands:bands];
 
       currentSurface = surface;
 
@@ -12471,6 +12514,20 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
       [self setContents:(id)currentSurface];
       [CATransaction commit];
 
+      /* The other surfaces now also lack what was drawn to this one,
+         which has become the contents.  Should it get no entry, it
+         will be copied whole.  */
+      for (int i = 0; i < 3; i++)
+        stale[i].bands |= damage;
+      for (int i = 0; i < 3; i++)
+        if (!stale[i].surface)
+          {
+            stale[i].surface = currentSurface;
+            stale[i].bands = 0;
+            break;
+          }
+      damage = 0;
+
       /* Put currentSurface back on the end of the cache.  */
       [cache addObject:(id)currentSurface];
       currentSurface = NULL;
@@ -12478,17 +12535,21 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 }
 
 
-/* Copy the contents of lastSurface to DESTINATION.  This is required
-   every time we want to use an IOSurface as its contents are probably
-   blanks (if it's new), or stale.  */
-- (void) copyContentsTo: (IOSurfaceRef) destination
+/* Copy the bands of rows in BANDS from the layer's contents to
+   DESTINATION.  This is required every time we want to use an
+   IOSurface as its contents are probably blanks (if it's new), or
+   stale.  */
+- (void) copyContentsTo: (IOSurfaceRef) destination bands: (uint64_t) bands
 {
   IOReturn lockStatus;
   IOSurfaceRef source = (IOSurfaceRef)[self contents];
-  void *sourceData, *destinationData;
-  int numBytes = IOSurfaceGetAllocSize (destination);
+  char *sourceData, *destinationData;
+  size_t rowBytes = IOSurfaceGetBytesPerRow (destination);
+  int height = IOSurfaceGetHeight (destination);
+  int rows = (height + 63) / 64;
+  static int check = -1;
 
-  NSTRACE_WHEN (NSTRACE_GROUP_FOCUS, "[EmacsLayer copyContentsTo:]");
+  NSTRACE_WHEN (NSTRACE_GROUP_FOCUS, "[EmacsLayer copyContentsTo:bands:]");
 
   if (!source || source == destination)
     return;
@@ -12504,7 +12565,25 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
   /* Since every IOSurface should have the exact same settings, a
      memcpy seems like the fastest way to copy the data from one to
      the other.  */
-  memcpy (destinationData, sourceData, numBytes);
+  for (int band = 0; band * rows < height; band++)
+    if (bands & (1ULL << band))
+      memcpy (destinationData + band * rows * rowBytes,
+	      sourceData + band * rows * rowBytes,
+	      min (rows, height - band * rows) * rowBytes);
+
+  /* With EMACS_NS_CHECK_DAMAGE set, report drawing that went
+     unrecorded: the two surfaces should now be the same.  */
+  if (check < 0)
+    check = getenv ("EMACS_NS_CHECK_DAMAGE") != NULL;
+  if (check)
+    for (int row = 0; row < height; row++)
+      if (memcmp (destinationData + row * rowBytes,
+		  sourceData + row * rowBytes,
+		  IOSurfaceGetWidth (destination) * 4))
+	{
+	  NSLog (@"Undamaged row %d of %d differs", row, height);
+	  break;
+	}
 
   lockStatus = IOSurfaceUnlock (source, kIOSurfaceLockReadOnly, nil);
   if (lockStatus != kIOReturnSuccess)

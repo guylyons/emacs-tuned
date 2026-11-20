@@ -783,11 +783,18 @@ enum ns_return_frame_mode
   IOSurfaceRef currentSurface;
   CGContextRef context;
   bool doubleBuffered;
+  /* The surface is split into 64 bands of rows.  A bit of damage is
+     set when that band was drawn to since the last display; a bit of
+     a cached surface's bands, when it differs there from the layer's
+     contents.  */
+  uint64_t damage;
+  struct { IOSurfaceRef surface; uint64_t bands; } stale[3];
 }
 - (id) initWithDoubleBuffered: (bool)db;
 - (void) setColorSpace: (CGColorSpaceRef)cs;
 - (void) setDoubleBuffered: (bool)db;
 - (CGContextRef) getContext;
+- (void) damageRect: (NSRect)rect;
 - (CGImageRef) copyImageOfRect: (NSRect)rect;
 @end
 #endif
