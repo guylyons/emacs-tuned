@@ -3728,6 +3728,10 @@ ns_draw_text_decoration (struct glyph_string *s, struct face *face,
   if (s->for_overlaps)
     return;
 
+  /* Most text has none, and setting a colour is not free.  */
+  if (!face->underline && !face->overline_p && !face->strike_through_p)
+    return;
+
   if (s->hl == DRAW_CURSOR)
     [FRAME_BACKGROUND_COLOR (s->f) set];
   else

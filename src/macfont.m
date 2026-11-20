@@ -599,20 +599,48 @@ mac_screen_font_shape (ScreenFontRef font, CFStringRef string,
                            glyph_layouts, glyph_len, dir);
 }
 
+/* Return the colour of pixel COLOR, its alpha scaled by ALPHA when
+   that is below 1.  The caller releases it.  Building a colour costs
+   far more than drawing a short run of glyphs with it, so the last
+   few are kept; a few dozen cover the faces on screen.  */
+static CGColorRef
+get_cgcolor_alpha (unsigned long color, double alpha)
+{
+  static struct
+  {
+    unsigned long color;
+    double alpha;
+    bool srgb;
+    CGColorRef ref;
+  } cache[64], *c;
+
+  c = &cache[(uint32_t) (color * 2654435761u) >> 26];
+  if (!(c->ref && c->color == color && c->alpha == alpha
+	&& c->srgb == ns_use_srgb_colorspace))
+    {
+      NSColor *nsColor = [NSColor colorWithUnsignedLong: color];
+      if (alpha < 1.0)
+	nsColor = [nsColor colorWithAlphaComponent:
+			     [nsColor alphaComponent] * alpha];
+      CGColorSpaceRef colorSpace = [[nsColor colorSpace] CGColorSpace];
+      NSInteger noc = [nsColor numberOfComponents];
+      CGFloat *components = xmalloc (sizeof (CGFloat) * (1 + noc));
+
+      [nsColor getComponents: components];
+      CGColorRelease (c->ref);
+      c->ref = CGColorCreate (colorSpace, components);
+      xfree (components);
+      c->color = color;
+      c->alpha = alpha;
+      c->srgb = ns_use_srgb_colorspace;
+    }
+  return CGColorRetain (c->ref);
+}
+
 static CGColorRef
 get_cgcolor(unsigned long color)
 {
-  NSColor *nsColor = [NSColor colorWithUnsignedLong:color];
-  [nsColor set];
-  CGColorSpaceRef colorSpace = [[nsColor colorSpace] CGColorSpace];
-  NSInteger noc = [nsColor numberOfComponents];
-  CGFloat *components = xmalloc (sizeof(CGFloat)*(1+noc));
-  CGColorRef cgColor;
-
-  [nsColor getComponents: components];
-  cgColor = CGColorCreate (colorSpace, components);
-  xfree (components);
-  return cgColor;
+  return get_cgcolor_alpha (color, 1);
 }
 
 static CGColorRef
@@ -3002,8 +3030,8 @@ macfont_draw (struct glyph_string *s, int from, int to, int x, int y,
           /* Translucent with `alpha-background'; copy rather than
              blend, or it would stack on the cleared background.  */
           CGColorRef refcol
-            = get_cgcolor_from_nscolor
-                (ns_background_color (f, NS_FACE_BACKGROUND (face)), f);
+            = get_cgcolor_alpha (NS_FACE_BACKGROUND (face),
+                                 f->alpha_background);
           CGContextSetFillColorWithColor (context, refcol);
           CGColorRelease (refcol);
           CGContextSetBlendMode (context, kCGBlendModeCopy);
