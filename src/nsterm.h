@@ -493,6 +493,12 @@ enum ns_return_frame_mode
      1 for the background image, 2 for the whole frame.  */
   int crtTarget, crtMask, noiseTarget;
   double crtIntensity, crtPitch, crtCurve, noiseIntensity;
+  /* A picture of the tab being dragged along the tab bar, the point
+     where the button went down on it, and whether a drag from there
+     may still show the picture.  */
+  CALayer *tabGhost;
+  NSPoint tabPress;
+  BOOL tabArmed;
 @public
   struct frame *emacsframe;
   int scrollbarsNeedingUpdate;
@@ -524,6 +530,8 @@ enum ns_return_frame_mode
        scanline: (double)pitch mask: (int)mask curvature: (double)curvature;
 - (void) setInterference: (int)target intensity: (double)intensity;
 - (void) attachBackgroundImage;
+- (void) dropTabGhost;
+- (void) dragTabGhost: (NSEvent *)e;
 #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
 - (void) updateCollectionBehavior;
 #endif
@@ -780,6 +788,7 @@ enum ns_return_frame_mode
 - (void) setColorSpace: (CGColorSpaceRef)cs;
 - (void) setDoubleBuffered: (bool)db;
 - (CGContextRef) getContext;
+- (CGImageRef) copyImageOfRect: (NSRect)rect;
 @end
 #endif
 

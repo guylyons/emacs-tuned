@@ -8076,6 +8076,7 @@ ns_drop_effect (EmacsEffect **effect)
   if (fs_state == FULLSCREEN_BOTH)
     [nonfs_window release];
 
+  [self dropTabGhost];
   ns_drop_effect (&backgroundEffect);
   ns_drop_effect (&glassEffect);
   ns_drop_effect (&staticEffect);
@@ -9015,6 +9016,11 @@ ns_in_echo_area (void)
 	    tab_bar_arg = handle_tab_bar_click (emacsframe, x, y,
 						EV_UDMODIFIERS (theEvent) & down_modifier,
 						EV_MODIFIERS (theEvent) | EV_UDMODIFIERS (theEvent));
+	  if ([theEvent type] == NSEventTypeLeftMouseDown)
+	    {
+	      tabArmed = tab_bar_p;
+	      tabPress = p;
+	    }
 	}
 
       if (!(tab_bar_p && NILP (tab_bar_arg)))
@@ -9054,7 +9060,83 @@ ns_in_echo_area (void)
 - (void)mouseUp: (NSEvent *)theEvent
 {
   NSTRACE ("[EmacsView mouseUp:]");
+  [self dropTabGhost];
   [self mouseDown: theEvent];
+}
+
+
+/* Remove the picture of the dragged tab.  */
+- (void)dropTabGhost
+{
+  tabArmed = NO;
+  [tabGhost removeFromSuperlayer];
+  [tabGhost release];
+  tabGhost = nil;
+}
+
+
+/* While the left button that went down on a tab is held, carry a
+   picture of that tab along the tab bar under the pointer.  Lisp moves
+   the tab itself when the button comes up (`tab-bar-mouse-move-tab');
+   this only shows what is being dragged.  */
+- (void)dragTabGhost: (NSEvent *)e
+{
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+  NSPoint p = [self convertPoint: [e locationInWindow] fromView: nil];
+  NSView *frameView = [[[self window] contentView] superview];
+  NSRect r;
+
+  if (!tabArmed)
+    return;
+
+  if (!tabGhost)
+    {
+      Emacs_Rectangle tab;
+      CGImageRef image;
+
+      /* Wait for a real drag, by which time redisplay has drawn the
+	 tab as selected.  */
+      if (fabs (p.x - tabPress.x) < 4)
+	return;
+
+      tabArmed = NO;
+      if (![frameView layer]
+	  || ![[self layer] isKindOfClass: [EmacsLayer class]]
+	  || !tab_bar_tab_rect (emacsframe, lrint (tabPress.x),
+				lrint (tabPress.y), &tab))
+	return;
+      r = NSMakeRect (tab.x, tab.y, tab.width, tab.height);
+      image = [(EmacsLayer *) [self layer] copyImageOfRect: r];
+      if (!image)
+	return;
+      tabArmed = YES;
+
+      tabGhost = [[CALayer alloc] init];
+      [CATransaction begin];
+      [CATransaction setDisableActions: YES];
+      [tabGhost setContents: (id) image];
+      [tabGhost setFrame: [self convertRect: r toView: frameView]];
+      [tabGhost setShadowOpacity: 0.6];
+      [tabGhost setShadowRadius: 6];
+      /* Above the frame's text, below the snow and the CRT's glass.  */
+      [tabGhost setZPosition: 0.5];
+      [[frameView layer] addSublayer: tabGhost];
+      [CATransaction commit];
+      CGImageRelease (image);
+      /* From here on, how far into the ghost the pointer holds it.  */
+      tabPress.x = ([self convertPoint: tabPress toView: frameView].x
+		    - NSMinX ([tabGhost frame]));
+    }
+
+  r = [tabGhost frame];
+  r.origin.x = [self convertPoint: p toView: frameView].x - tabPress.x;
+  r.origin.x = MAX (0, MIN (r.origin.x,
+			    NSWidth ([frameView bounds]) - NSWidth (r)));
+  [CATransaction begin];
+  [CATransaction setDisableActions: YES];
+  [tabGhost setFrame: r];
+  [CATransaction commit];
+#endif
 }
 
 
@@ -9156,6 +9238,7 @@ ns_in_echo_area (void)
 - (void)mouseDragged: (NSEvent *)e
 {
   NSTRACE ("[EmacsView mouseDragged:]");
+  [self dragTabGhost: e];
   [self mouseMoved: e];
 }
 
@@ -12426,6 +12509,53 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
   lockStatus = IOSurfaceUnlock (source, kIOSurfaceLockReadOnly, nil);
   if (lockStatus != kIOReturnSuccess)
     NSLog (@"Failed to unlock source surface: %x", (unsigned int)lockStatus);
+}
+
+/* Return a picture of RECT, in the view's coordinates, as it was last
+   displayed, or NULL.  The caller releases it.  It is a copy, since
+   the surfaces are drawn on again.  */
+- (CGImageRef) copyImageOfRect: (NSRect)rect
+{
+  IOSurfaceRef source = (IOSurfaceRef) [self contents];
+  CGFloat scale = [self contentsScale];
+  CGImageRef image = NULL;
+  CGDataProviderRef provider;
+  CFDataRef data;
+  UInt8 *bytes;
+  size_t x, y, width, height, row;
+
+  if (!source || CFGetTypeID (source) != IOSurfaceGetTypeID ())
+    return NULL;
+
+  rect = NSIntersectionRect (NSIntegralRect (rect), [self bounds]);
+  x = NSMinX (rect) * scale;
+  y = NSMinY (rect) * scale;
+  width = MIN (NSWidth (rect) * scale, IOSurfaceGetWidth (source) - x);
+  height = MIN (NSHeight (rect) * scale, IOSurfaceGetHeight (source) - y);
+  if (NSIsEmptyRect (rect) || x >= IOSurfaceGetWidth (source)
+      || y >= IOSurfaceGetHeight (source)
+      || IOSurfaceLock (source, kIOSurfaceLockReadOnly, nil) != kIOReturnSuccess)
+    return NULL;
+
+  /* The first row in memory is the top of the view.  */
+  bytes = xmalloc (width * height * 4);
+  for (row = 0; row < height; row++)
+    memcpy (bytes + row * width * 4,
+	    ((UInt8 *) IOSurfaceGetBaseAddress (source)
+	     + (y + row) * IOSurfaceGetBytesPerRow (source) + x * 4),
+	    width * 4);
+  IOSurfaceUnlock (source, kIOSurfaceLockReadOnly, nil);
+
+  data = CFDataCreate (NULL, bytes, width * height * 4);
+  xfree (bytes);
+  provider = CGDataProviderCreateWithCFData (data);
+  CFRelease (data);
+  image = CGImageCreate (width, height, 8, 32, width * 4, colorSpace,
+			 (kCGImageAlphaPremultipliedFirst
+			  | kCGBitmapByteOrder32Host),
+			 provider, NULL, false, kCGRenderingIntentDefault);
+  CGDataProviderRelease (provider);
+  return image;
 }
 
 #undef CACHE_MAX_SIZE

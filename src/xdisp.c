@@ -15326,6 +15326,57 @@ get_tab_bar_item_kbd (struct frame *f, int x, int y, int *prop_idx,
 }
 
 /* EXPORT:
+
+   If frame-relative X/Y on F is over a tab of the tab bar, as opposed
+   to a button, a separator or a group, store the tab's frame-relative
+   pixel rectangle in *RECT and return true.  */
+
+bool
+tab_bar_tab_rect (struct frame *f, int x, int y, Emacs_Rectangle *rect)
+{
+  struct window *w;
+  struct glyph_row *row;
+  struct glyph *glyph, *start, *end, *g;
+  int area, vpos, hpos, prop_idx, idx, left = 0, width = 0;
+  Lisp_Object key;
+
+  if (!WINDOWP (f->tab_bar_window) || !STRINGP (f->current_tab_bar_string))
+    return false;
+
+  w = XWINDOW (f->tab_bar_window);
+  frame_to_window_pixel_xy (w, &x, &y);
+  glyph = x_y_to_hpos_vpos (w, x, y, &hpos, &vpos, 0, 0, &area);
+  if (glyph == NULL || !tab_bar_item_info (f, glyph, &prop_idx, NULL))
+    return false;
+
+  /* tab-bar.el names a tab's item `current-tab' or `tab-N'.  */
+  key = AREF (f->tab_bar_items, prop_idx + TAB_BAR_ITEM_KEY);
+  if (!SYMBOLP (key)
+      || !(strcmp (SSDATA (SYMBOL_NAME (key)), "current-tab") == 0
+	   || strncmp (SSDATA (SYMBOL_NAME (key)), "tab-", 4) == 0))
+    return false;
+
+  row = MATRIX_ROW (w->current_matrix, vpos);
+  start = end = glyph;
+  while (start > row->glyphs[TEXT_AREA]
+	 && tab_bar_item_info (f, start - 1, &idx, NULL) && idx == prop_idx)
+    start--;
+  while (end + 1 < row->glyphs[TEXT_AREA] + row->used[TEXT_AREA]
+	 && tab_bar_item_info (f, end + 1, &idx, NULL) && idx == prop_idx)
+    end++;
+  for (g = row->glyphs[TEXT_AREA]; g < start; g++)
+    left += g->pixel_width;
+  for (; g <= end; g++)
+    width += g->pixel_width;
+
+  rect->x = WINDOW_TO_FRAME_PIXEL_X (w, row->x + left);
+  rect->y = WINDOW_TO_FRAME_PIXEL_Y (w, row->y);
+  rect->width = width;
+  rect->height = row->height;
+  return true;
+}
+
+/* EXPORT:
    Handle mouse button event on the tab-bar of frame F, at
    frame-relative coordinates X/Y.  DOWN_P is true for a button press,
    false for button release.  MODIFIERS is event modifiers for button
