@@ -1231,6 +1231,14 @@ ns_update_end (struct frame *f)
   [view unlockFocus];
 #if defined (NS_IMPL_GNUSTEP) || MAC_OS_X_VERSION_MIN_REQUIRED < 101400
   [[view window] flushWindow];
+#else
+  /* Present now, not at the next AppKit run loop turn, which
+     ns_select_1 skips while subprocess output is pending.  */
+  if ([NSThread isMainThread])
+    {
+      [[view layer] display];
+      [CATransaction flush];
+    }
 #endif
 
 #ifdef NS_IMPL_COCOA
