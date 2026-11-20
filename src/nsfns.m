@@ -358,6 +358,73 @@ ns_set_background_glitch (struct frame *f, Lisp_Object new_value,
       unblock_input ();
     }
 }
+
+
+/* What VALUE, an `ns-crt' or `ns-interference' parameter, applies to:
+   0 for nothing, 1 for the background image, 2 for the whole frame.  */
+static int
+ns_effect_target (Lisp_Object value)
+{
+  return (NILP (value) ? 0
+          : CONSP (value) && EQ (plist_get (value, QCtarget), Qframe) ? 2 : 1);
+}
+
+/* The number under KEY in the plist VALUE, clamped to LO..HI, or DEF.  */
+static double
+ns_effect_number (Lisp_Object value, Lisp_Object key, double def,
+                  double lo, double hi)
+{
+  Lisp_Object v = CONSP (value) ? plist_get (value, key) : Qnil;
+
+  return NUMBERP (v) ? fmax (lo, fmin (XFLOATINT (v), hi)) : def;
+}
+
+/* Show F as a CRT would if NEW_VALUE is non-nil.  NEW_VALUE may be a
+   plist: :target is `background' (the default) to show only the
+   `ns-background-image' so, redrawn scanline by scanline, or `frame' to
+   lay the scanlines and phosphor mask over the whole frame; :intensity
+   is a percentage (default 100); :scanline is a scanline's height in
+   points (default 4); :mask is `grille', `slot' (the default) or
+   `shadow'; and :curvature is a percentage (default 0) by which the
+   background image bulges.  */
+static void
+ns_set_crt (struct frame *f, Lisp_Object new_value, Lisp_Object old_value)
+{
+  EmacsView *view = FRAME_NS_VIEW (f);
+  Lisp_Object mask = CONSP (new_value) ? plist_get (new_value, QCmask) : Qnil;
+
+  if (view)
+    {
+      block_input ();
+      [view setCRT: ns_effect_target (new_value)
+         intensity: ns_effect_number (new_value, QCintensity, 100, 0, 100) / 100
+          scanline: ns_effect_number (new_value, QCscanline, 4, 1, 16)
+              mask: EQ (mask, Qgrille) ? 0 : EQ (mask, Qshadow) ? 2 : 1
+         curvature: ns_effect_number (new_value, QCcurvature, 0, 0, 100) / 100];
+      unblock_input ();
+    }
+}
+
+/* Lay faint television interference over F if NEW_VALUE is non-nil.
+   NEW_VALUE may be a plist: :target is `background' (the default) for
+   only the `ns-background-image', or `frame' for the whole frame, and
+   :intensity is a percentage of the designed strength (default 100, up
+   to 400).  */
+static void
+ns_set_interference (struct frame *f, Lisp_Object new_value,
+                     Lisp_Object old_value)
+{
+  EmacsView *view = FRAME_NS_VIEW (f);
+
+  if (view)
+    {
+      block_input ();
+      [view setInterference: ns_effect_target (new_value)
+                  intensity: ns_effect_number (new_value, QCintensity,
+                                               100, 0, 400) / 100];
+      unblock_input ();
+    }
+}
 #endif
 
 
@@ -1189,6 +1256,8 @@ frame_parm_handler ns_frame_parm_handlers[] =
   ns_set_transparent_titlebar,
   ns_set_background_image,
   ns_set_background_glitch,
+  ns_set_crt,
+  ns_set_interference,
 #endif
   NULL,
   NULL,
@@ -1629,6 +1698,10 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame,
   gui_default_parameter (f, parms, Qns_background_image, Qnil,
                          NULL, NULL, RES_TYPE_STRING);
   gui_default_parameter (f, parms, Qns_background_glitch, Qnil,
+                         NULL, NULL, RES_TYPE_BOOLEAN);
+  gui_default_parameter (f, parms, Qns_crt, Qnil,
+                         NULL, NULL, RES_TYPE_BOOLEAN);
+  gui_default_parameter (f, parms, Qns_interference, Qnil,
                          NULL, NULL, RES_TYPE_BOOLEAN);
 #endif
   gui_default_parameter (f, parms, Qborders_respect_alpha_background, Qnil,
@@ -4305,6 +4378,11 @@ syms_of_nsfns (void)
   DEFSYM (QCintensity, ":intensity");
   DEFSYM (Qdrift, "drift");
   DEFSYM (Qhard, "hard");
+  DEFSYM (QCtarget, ":target");
+  DEFSYM (QCscanline, ":scanline");
+  DEFSYM (QCcurvature, ":curvature");
+  DEFSYM (Qgrille, "grille");
+  DEFSYM (Qshadow, "shadow");
   DEFSYM (Qlight, "light");
 
   DEFVAR_LISP ("ns-icon-type-alist", Vns_icon_type_alist,

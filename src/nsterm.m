@@ -7133,7 +7133,8 @@ ns_create_font_panel_buttons (id target, SEL select, SEL cancel_action)
 #ifdef NS_IMPL_COCOA
 /* ==========================================================================
 
-    Background image glitch (`ns-background-glitch')
+    Background image glitch (`ns-background-glitch'), CRT (`ns-crt')
+    and interference (`ns-interference')
 
    ========================================================================== */
 
@@ -7141,14 +7142,29 @@ ns_create_font_panel_buttons (id target, SEL select, SEL cancel_action)
    up like a damaged video stream and then hunts back into focus.  A
    Metal layer over the static image draws only during these bursts, on
    its own thread, so a busy Emacs neither stalls it nor pays for it in
-   between.  */
+   between.
 
-static const char glitch_shader[] =
+   The same layer can show the image as a CRT would, glitches and all.
+   This follows CRT-Royale (crt/shaders/crt-royale in libretro's
+   slang-shaders, by TroggleMonkey, GPLv2 or later) in one pass: its
+   scanline beam, a phosphor mask, a little diffusion, its border, and
+   its gamma.  Its multi-pass bloom, convergence offsets and spherical
+   geometry are left out.
+
+   The text cannot be resampled, so over the whole frame the CRT is
+   instead a pane that multiplies what is under it by the scanlines and
+   the mask.  Interference is a third kind of layer, laying static over
+   either the image or the frame.  */
+
+static const char effect_shader[] =
   "#include <metal_stdlib>\n"
   "using namespace metal;\n"
   "struct V { float4 pos [[position]]; float2 uv; };\n"
   "struct U { float2 size, scale;\n"
-  "           float time, seed, focus, split, tear, blocks, noise, pad; };\n"
+  "           float time, seed, focus, split, tear, blocks, noise, lod;\n"
+  "           float crt, pitch, mask, curve; };\n"
+  "constexpr sampler s (filter::linear, mip_filter::linear,\n"
+  "                     s_address::repeat, t_address::clamp_to_edge);\n"
   "static float hash (float a, float b, float c)\n"
   "{\n"
   "  uint3 v = uint3 (int3 (float3 (a, b, c))) * 1664525u + 1013904223u;\n"
@@ -7165,12 +7181,11 @@ static const char glitch_shader[] =
   "  v.uv = float2 (p.x, 1.0 - p.y);\n"
   "  return v;\n"
   "}\n"
-  "fragment float4 fmain (V in [[stage_in]], constant U &u [[buffer (0)]],\n"
-  "                       texture2d<float> tex [[texture (0)]])\n"
+  /* The image at UV0, glitched.  The mip level is explicit because the
+     CRT samples whole scanlines, which have no useful derivative.  */
+  "static float4 picture (float2 uv0, constant U &u, texture2d<float> tex)\n"
   "{\n"
-  "  constexpr sampler s (filter::linear, mip_filter::linear,\n"
-  "                       s_address::repeat, t_address::clamp_to_edge);\n"
-  "  float2 px = in.uv * u.size, uv = in.uv;\n"
+  "  float2 px = uv0 * u.size, uv = uv0;\n"
   /* Tearing: bands of rows slide sideways, plus the odd hairline.  */
   "  float band = floor (uv.y * mix (6.0, 40.0, hash (u.seed, 1, 0))\n"
   "                      + hash (u.seed, 2, 0));\n"
@@ -7182,7 +7197,7 @@ static const char glitch_shader[] =
   /* A damaged stream: from some row down the picture slips and its
      channels swap, and scattered macroblocks show the wrong part of
      the picture, some decoded as coarse 8px cells.  */
-  "  bool slip = in.uv.y > hash (u.seed, 7, 0)\n"
+  "  bool slip = uv0.y > hash (u.seed, 7, 0)\n"
   "              && hash (u.seed, 8, 0) < u.blocks * 0.6;\n"
   "  if (slip)\n"
   "    uv.x += (hash (u.seed, 9, 0) - 0.5) * 0.3;\n"
@@ -7206,8 +7221,9 @@ static const char glitch_shader[] =
   "  float a = 0.0;\n"
   "  if (radius < 0.5)\n"
   "    {\n"
-  "      float4 g = tex.sample (s, tuv);\n"
-  "      c = float3 (tex.sample (s, tuv + ca).r, g.g, tex.sample (s, tuv - ca).b);\n"
+  "      float4 g = tex.sample (s, tuv, level (u.lod));\n"
+  "      c = float3 (tex.sample (s, tuv + ca, level (u.lod)).r, g.g,\n"
+  "                  tex.sample (s, tuv - ca, level (u.lod)).b);\n"
   "      a = g.a;\n"
   "    }\n"
   "  else\n"
@@ -7215,16 +7231,16 @@ static const char glitch_shader[] =
   /* A golden-angle disc of taps, turned per pixel so the gaps between
      them dither into grain; blurrier mip levels fill them in.
      Highlights weigh more, blooming into bokeh.  */
-  "      float lod = log2 (radius / 4.0 + 1.0), w = 0.0;\n"
+  "      float lod = u.lod + log2 (radius / 4.0 + 1.0), w = 0.0;\n"
   "      float rot = hash (px.x, px.y, 11) * 6.2832;\n"
   "      for (int i = 0; i < 16; i++)\n"
   "        {\n"
   "          float th = i * 2.39996 + rot;\n"
   "          float2 o = float2 (cos (th), sin (th))\n"
   "                     * sqrt ((i + 0.5) / 16.0) * radius * texel;\n"
-  "          float4 g = tex.sample (s, tuv + o, bias (lod));\n"
-  "          float3 t = float3 (tex.sample (s, tuv + o + ca, bias (lod)).r, g.g,\n"
-  "                             tex.sample (s, tuv + o - ca, bias (lod)).b);\n"
+  "          float4 g = tex.sample (s, tuv + o, level (lod));\n"
+  "          float3 t = float3 (tex.sample (s, tuv + o + ca, level (lod)).r, g.g,\n"
+  "                             tex.sample (s, tuv + o - ca, level (lod)).b);\n"
   "          float k = 1.0 + pow (dot (t, float3 (0.299, 0.587, 0.114)), 4.0)\n"
   "                          * 6.0 * u.focus;\n"
   "          c += t * k;\n"
@@ -7244,14 +7260,139 @@ static const char glitch_shader[] =
   "  c *= 1.0 - u.noise * (fmod (floor (px.y), 3.0) < 1.0 ? 0.1 : 0.0);\n"
   "  c += (hash (px.x, px.y, floor (u.time * 60.0)) - 0.5) * u.noise * 0.1;\n"
   "  return float4 (clamp (c, 0.0, a), a);\n"
+  "}\n"
+  /* CRT-Royale's beam: a generalized Gaussian across the scanline whose
+     width and squareness grow with brightness, so bright lines swell
+     into their neighbours and dark ones stay thin.  DIST is in
+     scanlines, as is the pixel height PH; three taps a third of a pixel
+     apart antialias it.  Each line deposits COL per scanline, so the
+     picture keeps its brightness.  */
+  "static float3 beam (float dist, float3 col, float ph)\n"
+  "{\n"
+  "  float3 sigma = 0.02 + 0.28 * pow (col, float3 (1.0 / 3.0));\n"
+  "  float3 beta = 2.0 + 2.0 * pow (col, float3 (0.25));\n"
+  "  float3 alpha = 1.41421356 * sigma, x = 1.0 / beta, w = 0.0;\n"
+  /* Gamma (1 + x), Abramowitz and Stegun 6.1.35.  */
+  "  float3 g = 1.0 + x * (-0.5748646 + x * (0.9512363 + x * (-0.6998588\n"
+  "             + x * (0.4245549 - x * 0.1010678))));\n"
+  "  for (int i = -1; i <= 1; i++)\n"
+  "    w += exp (-pow (abs (dist + i * ph / 3.0) / alpha, beta));\n"
+  "  return col * 0.5 / (alpha * g) * w / 3.0;\n"
+  "}\n"
+  /* The phosphor mask at device pixel PX: an aperture grille (0), slot
+     mask (1) or shadow mask (2), its triads about a scanline wide.
+     Unlit phosphor passes 0.3.  */
+  "static float3 mask (float2 px, constant U &u)\n"
+  "{\n"
+  "  float w = max (1.0, floor (u.pitch / 3.0 + 0.5));\n"
+  "  float x = px.x, row = floor (px.y / w);\n"
+  "  if (u.mask == 2.0)\n"
+  "    x += fmod (floor (row / 2.0), 2.0) * 1.5 * w;\n"
+  "  float col = floor (x / w);\n"
+  "  float3 m = select (float3 (0.3), float3 (1.0),\n"
+  "                     float3 (fmod (col, 3.0)) == float3 (0.0, 1.0, 2.0));\n"
+  "  if (u.mask == 1.0\n"
+  "      && fmod (row + 3.0 * fmod (floor (col / 3.0), 2.0), 6.0) < 1.0)\n"
+  "    m *= 0.3;\n"
+  "  return m;\n"
+  "}\n"
+  /* CRT-Royale's border: dim towards the tube's edge, rounding its
+     corners.  */
+  "static float border (float2 uv, constant U &u)\n"
+  "{\n"
+  "  float2 e = min (uv, 1.0 - uv) * u.size / min (u.size.x, u.size.y);\n"
+  "  float pen = length (max (0.015 - e, 0.0)) / 0.015;\n"
+  "  return min (pow (max (1.0 - pen, 0.0), 2.0) * 2.5, 1.0);\n"
+  "}\n"
+  "fragment float4 fmain (V in [[stage_in]], constant U &u [[buffer (0)]],\n"
+  "                       texture2d<float> tex [[texture (0)]])\n"
+  "{\n"
+  "  if (u.crt <= 0.0)\n"
+  "    return picture (in.uv, u, tex);\n"
+  /* Bulge like a tube, keeping the middle of each edge in place.  */
+  "  float2 d = in.uv - 0.5;\n"
+  "  float2 uv = 0.5 + d * (1.0 + u.curve * dot (d, d)) / (1.0 + u.curve * 0.25);\n"
+  "  if (any (uv != saturate (uv)))\n"
+  "    return float4 (0.0, 0.0, 0.0, 1.0);\n"
+  /* The two scanlines nearest a pixel light it, in linear light.  */
+  "  float rows = u.size.y / u.pitch, y = uv.y * rows - 0.5, k = floor (y);\n"
+  "  float4 p0 = picture (float2 (uv.x, (k + 0.5) / rows), u, tex);\n"
+  "  float4 p1 = picture (float2 (uv.x, (k + 1.5) / rows), u, tex);\n"
+  "  float3 c0 = pow (p0.rgb, float3 (2.5)), c1 = pow (p1.rgb, float3 (2.5));\n"
+  "  float3 c = mix (mix (c0, c1, y - k),\n"
+  "                  beam (y - k, c0, 1.0 / u.pitch)\n"
+  "                  + beam (y - k - 1.0, c1, 1.0 / u.pitch), u.crt);\n"
+  /* Diffusion: light scattered in the glass.  */
+  "  float3 glow = tex.sample (s, (uv - 0.5) * u.scale + 0.5,\n"
+  "                            level (u.lod + 4.0)).rgb;\n"
+  "  c = mix (c, pow (glow, float3 (2.5)), 0.075 * u.crt);\n"
+  /* The mask would halve the brightness, so scale it back up and let
+     what overflows a phosphor spill into its neighbours, as bloom does.  */
+  "  c *= mix (float3 (1.0), mask (in.uv * u.size, u)\n"
+  "                          / (u.mask == 1.0 ? 0.4711 : 0.5333), u.crt);\n"
+  "  c = min (c, 1.0) + dot (max (c - 1.0, 0.0), float3 (1.0 / 3.0));\n"
+  "  c *= border (uv, u);\n"
+  "  float a = max (p0.a, p1.a);\n"
+  "  c = pow (c, float3 (1.0 / mix (2.5, 2.2, u.crt)));\n"
+  "  return float4 (clamp (c, 0.0, a), a);\n"
+  "}\n"
+  /* The CRT over the whole frame: what to multiply the frame by.  */
+  "fragment float4 fglass (V in [[stage_in]], constant U &u [[buffer (0)]])\n"
+  "{\n"
+  "  float2 px = in.uv * u.size;\n"
+  "  float y = px.y / u.pitch - 0.5, k = floor (y), ph = 1.0 / u.pitch;\n"
+  "  float3 grey = float3 (0.5);\n"
+  "  float line = (beam (y - k, grey, ph) + beam (y - k - 1.0, grey, ph)).g\n"
+  "               / beam (0.0, grey, ph).g;\n"
+  "  float3 m = mix (float3 (1.0), mask (px, u), 0.4 * u.crt)\n"
+  "             * mix (1.0, min (line, 1.0), 0.45 * u.crt);\n"
+  "  return float4 (m, 1.0);\n"
+  "}\n"
+  "static float vnoise (float2 p)\n"
+  "{\n"
+  "  float2 i = floor (p), f = p - i;\n"
+  "  f = f * f * (3.0 - 2.0 * f);\n"
+  "  return mix (mix (hash (i.x, i.y, 21), hash (i.x + 1.0, i.y, 21), f.x),\n"
+  "              mix (hash (i.x, i.y + 1.0, 21),\n"
+  "                   hash (i.x + 1.0, i.y + 1.0, 21), f.x), f.y);\n"
+  "}\n"
+  /* Interference, premultiplied: RGB is light added and alpha is shade.
+     Here u.pitch is the pixels in a point.  */
+  "fragment float4 fstatic (V in [[stage_in]], constant U &u [[buffer (0)]])\n"
+  "{\n"
+  "  float2 px = in.uv * u.size / u.pitch;\n"
+  "  float frame = floor (u.time * 30.0);\n"
+  /* Snow, in short streaks as a band-limited signal draws it.  It comes
+     and goes in drifting bands rather than covering the picture.  */
+  "  float here = smoothstep (0.5, 0.85,\n"
+  "                           vnoise (float2 (in.uv.x * 1.5 + u.time * 0.07,\n"
+  "                                           in.uv.y * 5.0 - u.time * 0.25)))\n"
+  "               * smoothstep (0.25, 0.6, vnoise (float2 (u.time * 0.2, 9.0)));\n"
+  "  float n = (hash (floor (px.x / 2.0), floor (px.y), frame) - 0.5)\n"
+  "            * 0.1 * (0.3 + here);\n"
+  /* A faint hum bar rolls up the screen.  */
+  "  float h = fract (in.uv.y * 0.7 + u.time * 0.05);\n"
+  "  float hum = 0.03 * smoothstep (0.0, 0.12, h)\n"
+  "              * (1.0 - smoothstep (0.12, 0.3, h));\n"
+  /* A few times a second an impulse draws a short bright dash.  */
+  "  float row = floor (px.y), spark = 0.0;\n"
+  "  if (hash (row, frame, 31) < 0.085 * u.pitch / u.size.y)\n"
+  "    {\n"
+  "      float x = px.x - hash (row, frame, 32) * u.size.x / u.pitch;\n"
+  "      if (x > 0.0)\n"
+  "        spark = 0.3 * exp (-x / mix (6.0, 30.0, hash (row, frame, 33)));\n"
+  "    }\n"
+  "  return float4 (float3 (max (n, 0.0) + spark) * u.noise,\n"
+  "                 min ((max (-n, 0.0) + hum) * u.noise, 1.0));\n"
   "}\n";
 
 /* The shader's U.  */
 typedef struct
 {
   float size[2], scale[2];
-  float time, seed, focus, split, tear, blocks, noise, pad;
-} GlitchUniforms;
+  float time, seed, focus, split, tear, blocks, noise, lod;
+  float crt, pitch, mask, curve;
+} EffectUniforms;
 
 static double
 glitch_random (void)
@@ -7259,34 +7400,64 @@ glitch_random (void)
   return arc4random () / 4294967296.0;
 }
 
-@interface EmacsGlitch : NSObject
+/* A Metal layer that tells its render thread when to draw it afresh.  */
+@interface EmacsEffectLayer : CAMetalLayer
+{
+@public
+  atomic_bool resized;
+}
+@end
+
+@implementation EmacsEffectLayer
+
+- (void)setBounds: (CGRect)bounds
+{
+  [super setBounds: bounds];
+  atomic_store (&resized, true);
+}
+
+- (void)setContentsScale: (CGFloat)scale
+{
+  [super setContentsScale: scale];
+  atomic_store (&resized, true);
+}
+
+@end
+
+@interface EmacsEffect : NSObject
 {
   NSImage *image;
   CGImageRef cgimage;
   CGColorSpaceRef colorspace;
-  CAMetalLayer *layer;
+  EmacsEffectLayer *layer;
   id<MTLCommandQueue> queue;
   id<MTLRenderPipelineState> pipeline;
   id<MTLTexture> texture;
-  atomic_bool stopped;
+  atomic_bool stopped, paused;
   double interval, intensity, hardChance;
+  EffectUniforms look;
   CGSize drawableSize;
+  CGFloat drawableScale;
+  BOOL visible;
 }
 @end
 
-@implementation EmacsGlitch
+@implementation EmacsEffect
 
-/* INTERVAL is the mean number of seconds between bursts, INTENSITY
-   scales every effect (1 is the designed look) and HARD is the
-   chance a burst is a hard glitch rather than a drift.  */
+/* With an image this draws the image: INTERVAL is the mean number of
+   seconds between glitch bursts (0 for none), INTENSITY scales every
+   glitch (1 is the designed look), HARD is the chance a burst is a
+   hard glitch rather than a drift, and U.crt makes it a CRT.  Without
+   one it draws interference if U.noise, else the CRT's pane.  */
 - (instancetype)initWithImage: (NSImage *)img interval: (double)secs
                     intensity: (double)scale hard: (double)chance
+                         look: (EffectUniforms)u
 {
   id<MTLDevice> device = MTLCreateSystemDefaultDevice ();
   CGImageRef cg = [img CGImageForProposedRect: NULL context: nil hints: nil];
   CGColorSpaceRef cs = cg ? CGImageGetColorSpace (cg) : NULL;
 
-  if (!(self = [super init]) || !device || !cg)
+  if (!(self = [super init]) || !device || (img && !cg))
     {
       [device release];
       [self release];
@@ -7297,12 +7468,13 @@ glitch_random (void)
   interval = secs;
   intensity = scale;
   hardChance = chance;
+  look = u;
   cgimage = CGImageRetain (cg);
   /* Match the static image's colours exactly.  */
   colorspace = (cs && CGColorSpaceGetModel (cs) == kCGColorSpaceModelRGB
                 ? CGColorSpaceRetain (cs)
                 : CGColorSpaceCreateWithName (kCGColorSpaceSRGB));
-  layer = [[CAMetalLayer alloc] init];
+  layer = [[EmacsEffectLayer alloc] init];
   [layer setDevice: device];
   [device release];
   [layer setPixelFormat: MTLPixelFormatBGRA8Unorm];
@@ -7310,10 +7482,18 @@ glitch_random (void)
   [layer setOpaque: NO];
   [layer setHidden: YES];
   [layer setAutoresizingMask: kCALayerWidthSizable | kCALayerHeightSizable];
+  if (!img && !u.noise)
+    [layer setCompositingFilter: @"multiplyBlendMode"];
   [NSThread detachNewThreadSelector: @selector (run)
                            toTarget: self
                          withObject: nil];
   return self;
+}
+
+/* Stop animating, as when nobody can see the window.  */
+- (void)setPaused: (BOOL)flag
+{
+  atomic_store (&paused, flag);
 }
 
 - (NSImage *)image
@@ -7351,18 +7531,20 @@ glitch_random (void)
   id<MTLDevice> device = [layer device];
   NSError *err = nil;
   id<MTLLibrary> lib = [device newLibraryWithSource:
-                                 [NSString stringWithUTF8String: glitch_shader]
+                                 [NSString stringWithUTF8String: effect_shader]
                                             options: nil
                                               error: &err];
   if (!lib)
     {
-      NSLog (@"ns-background-glitch: %@", err);
+      NSLog (@"Emacs background effect: %@", err);
       return NO;
     }
 
   MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
   id<MTLFunction> vf = [lib newFunctionWithName: @"vmain"];
-  id<MTLFunction> ff = [lib newFunctionWithName: @"fmain"];
+  id<MTLFunction> ff = [lib newFunctionWithName: (image ? @"fmain"
+                                                  : look.noise ? @"fstatic"
+                                                  : @"fglass")];
   [desc setVertexFunction: vf];
   [desc setFragmentFunction: ff];
   [[desc colorAttachments][0] setPixelFormat: [layer pixelFormat]];
@@ -7373,10 +7555,12 @@ glitch_random (void)
   [lib release];
   if (!pipeline)
     {
-      NSLog (@"ns-background-glitch: %@", err);
+      NSLog (@"Emacs background effect: %@", err);
       return NO;
     }
   queue = [device newCommandQueue];
+  if (!cgimage)
+    return YES;
 
   size_t w = CGImageGetWidth (cgimage), h = CGImageGetHeight (cgimage);
   double k = MIN (1.0, 8192.0 / MAX (w, h));
@@ -7419,18 +7603,45 @@ glitch_random (void)
         return;
     }
 
+  /* A CRT and interference stay up, where a glitch shows only during
+     its bursts, and only interference moves in between.  */
+  BOOL steady = !image || look.crt, moving = !image && look.noise;
+  double tick = steady ? 1.0 / 30 : 0.1;
+  /* Long quiet spells keep a glitch rare enough to land.  */
+  double rest = interval * (0.45 + glitch_random () * 1.1);
+
   while (!atomic_load (&stopped))
     @autoreleasepool
       {
-        /* Long quiet spells keep it rare enough to land.  */
-        for (double rest = interval * (0.45 + glitch_random () * 1.1);
-             rest > 0 && !atomic_load (&stopped); rest -= 0.1)
-          [NSThread sleepForTimeInterval: 0.1];
+        BOOL still = (atomic_load (&paused)
+                      || [[NSWorkspace sharedWorkspace]
+                           accessibilityDisplayShouldReduceMotion]);
+        BOOL fit = atomic_exchange (&layer->resized, false) || !visible;
 
-        if (!atomic_load (&stopped)
-            && ![[NSWorkspace sharedWorkspace]
-                  accessibilityDisplayShouldReduceMotion])
-          [self burst];
+        if (steady && (fit || (moving && !still)))
+          {
+            if (fit)
+              [self performSelectorOnMainThread: @selector (fitDrawable)
+                                     withObject: nil
+                                  waitUntilDone: YES];
+
+            EffectUniforms u = [self uniforms];
+
+            if (u.size[0] >= 1 && u.size[1] >= 1)
+              {
+                u.time = fmod (CACurrentMediaTime (), 4096);
+                [self render: &u wait: !visible];
+                [self show: YES];
+              }
+          }
+
+        [NSThread sleepForTimeInterval: tick];
+        if (interval && (rest -= tick) <= 0)
+          {
+            if (!still && !atomic_load (&stopped))
+              [self burst];
+            rest = interval * (0.45 + glitch_random () * 1.1);
+          }
       }
 }
 
@@ -7439,15 +7650,14 @@ glitch_random (void)
    corrupts the tree.  These run there via performSelectorOnMainThread.  */
 - (void)fitDrawable
 {
-  CGFloat sc = [layer contentsScale];
   CGSize s = [layer bounds].size;
 
-  drawableSize = CGSizeMake (s.width * sc, s.height * sc);
+  drawableScale = [layer contentsScale];
+  drawableSize = CGSizeMake (s.width * drawableScale, s.height * drawableScale);
   [CATransaction begin];
   [CATransaction setDisableActions: YES];
   if (drawableSize.width >= 1 && drawableSize.height >= 1)
     [layer setDrawableSize: drawableSize];
-  [layer setHidden: YES];
   [CATransaction commit];
 }
 
@@ -7459,12 +7669,43 @@ glitch_random (void)
   [CATransaction commit];
 }
 
-- (void)render: (GlitchUniforms *)u wait: (BOOL)wait
+- (void)show: (BOOL)flag
+{
+  if (visible != flag)
+    [self performSelectorOnMainThread: @selector (setLayerHidden:)
+                           withObject: [NSNumber numberWithBool: !flag]
+                        waitUntilDone: NO];
+  visible = flag;
+}
+
+/* The look at rest, for the drawable as last fitted.  */
+- (EffectUniforms)uniforms
+{
+  EffectUniforms u = look;
+
+  u.size[0] = drawableSize.width;
+  u.size[1] = drawableSize.height;
+  u.pitch *= drawableScale;
+  if (texture && u.size[0] >= 1 && u.size[1] >= 1)
+    {
+      double fill = MAX (u.size[0] / [texture width],
+                         u.size[1] / [texture height]);
+
+      u.scale[0] = u.size[0] / ([texture width] * fill);
+      u.scale[1] = u.size[1] / ([texture height] * fill);
+      /* The mip level whose texels are a pixel wide, or for a CRT half
+         a scanline, since a scanline shows one row of the image.  */
+      u.lod = MAX (0, log2 ((u.crt ? u.pitch / 2 : 1) / fill));
+    }
+  return u;
+}
+
+- (void)render: (EffectUniforms *)u wait: (BOOL)wait
 {
   @autoreleasepool
     {
       id<CAMetalDrawable> drawable = [layer nextDrawable];
-      GlitchUniforms v = *u;
+      EffectUniforms v = *u;
 
       if (!drawable)
         return;
@@ -7485,7 +7726,8 @@ glitch_random (void)
         = [cb renderCommandEncoderWithDescriptor: pass];
       [enc setRenderPipelineState: pipeline];
       [enc setFragmentBytes: &v length: sizeof v atIndex: 0];
-      [enc setFragmentTexture: texture atIndex: 0];
+      if (texture)
+        [enc setFragmentTexture: texture atIndex: 0];
       [enc drawPrimitives: MTLPrimitiveTypeTriangle vertexStart: 0
               vertexCount: 3];
       [enc endEncoding];
@@ -7505,14 +7747,10 @@ glitch_random (void)
                          withObject: nil
                       waitUntilDone: YES];
 
-  GlitchUniforms u = { { drawableSize.width, drawableSize.height } };
+  EffectUniforms u = [self uniforms];
 
   if (u.size[0] < 1 || u.size[1] < 1)
     return;
-  double fill = MAX (u.size[0] / [texture width],
-                     u.size[1] / [texture height]);
-  u.scale[0] = u.size[0] / ([texture width] * fill);
-  u.scale[1] = u.size[1] / ([texture height] * fill);
 
   BOOL hard = glitch_random () < hardChance;
   double len = hard ? 0.3 + glitch_random () * 0.9 : 1.8 + glitch_random () * 1.8;
@@ -7523,7 +7761,6 @@ glitch_random (void)
                   ? len * (0.35 + glitch_random () * 0.3) : -1);
   float flick_seed = arc4random_uniform (65536);
   double start = CACurrentMediaTime (), hold = 0;
-  BOOL shown = NO;
 
   for (double t = 0; t < len + settle && !atomic_load (&stopped);
        t = CACurrentMediaTime () - start)
@@ -7569,24 +7806,28 @@ glitch_random (void)
           u.seed = flick_seed;
         }
 
-      [self render: &u wait: !shown];
-      if (!shown)
-        [self performSelectorOnMainThread: @selector (setLayerHidden:)
-                               withObject: [NSNumber numberWithBool: NO]
-                            waitUntilDone: NO];
-      shown = YES;
+      [self render: &u wait: !visible];
+      [self show: YES];
       [NSThread sleepForTimeInterval: 1.0 / 60];
     }
 
-  /* End on the clean image, identical to the layer below.  */
+  /* End on the clean image, identical to the layer below unless this
+     is a CRT, which stays up.  */
   u.focus = u.split = u.tear = u.blocks = u.noise = 0;
   [self render: &u wait: YES];
-  [self performSelectorOnMainThread: @selector (setLayerHidden:)
-                         withObject: [NSNumber numberWithBool: YES]
-                      waitUntilDone: NO];
+  if (!look.crt)
+    [self show: NO];
 }
 
 @end
+
+static void
+ns_drop_effect (EmacsEffect **effect)
+{
+  [*effect stop];
+  [*effect release];
+  *effect = nil;
+}
 #endif
 
 /* ==========================================================================
@@ -7622,18 +7863,15 @@ glitch_random (void)
   NSView *content = [[self window] contentView];
   CALayer *frameLayer = [[content superview] layer];
 
-  if (backgroundGlitch
-      && (!glitchInterval || !frameLayer
-          || [backgroundGlitch image] != backgroundImage))
-    {
-      [backgroundGlitch stop];
-      [backgroundGlitch release];
-      backgroundGlitch = nil;
-    }
+  if (backgroundEffect
+      && (!(glitchInterval || crtTarget == 1) || !frameLayer
+          || [backgroundEffect image] != backgroundImage))
+    ns_drop_effect (&backgroundEffect);
 
   if (!backgroundImage || !frameLayer)
     {
       [backgroundImageLayer removeFromSuperlayer];
+      [self attachOverlays: frameLayer];
       return;
     }
 
@@ -7667,21 +7905,73 @@ glitch_random (void)
                               MAX (0, bounds.size.height - top))];
   [tint setBackgroundColor: [[[self window] backgroundColor] CGColor]];
 
-  /* The glitch layer sits between the image and the tint.  */
-  if (glitchInterval && !backgroundGlitch)
-    backgroundGlitch = [[EmacsGlitch alloc] initWithImage: backgroundImage
-                                                 interval: glitchInterval
-                                                intensity: glitchIntensity
-                                                     hard: glitchHard];
-  if (backgroundGlitch)
+  /* The layer that redraws the image sits between it and the tint.  */
+  if ((glitchInterval || crtTarget == 1) && !backgroundEffect)
     {
-      CALayer *glitch = [backgroundGlitch layer];
+      EffectUniforms look = { .crt = crtTarget == 1 ? crtIntensity : 0,
+                              .pitch = crtPitch, .mask = crtMask,
+                              .curve = crtCurve };
 
-      [glitch setFrame: [backgroundImageLayer bounds]];
-      [glitch setContentsScale: [[self window] backingScaleFactor]];
-      if ([glitch superlayer] != backgroundImageLayer)
-        [backgroundImageLayer insertSublayer: glitch atIndex: 0];
+      backgroundEffect = [[EmacsEffect alloc] initWithImage: backgroundImage
+                                                   interval: glitchInterval
+                                                  intensity: glitchIntensity
+                                                       hard: glitchHard
+                                                       look: look];
     }
+  [self placeEffect: backgroundEffect in: backgroundImageLayer z: -2];
+  [self attachOverlays: frameLayer];
+}
+
+
+- (void)placeEffect: (EmacsEffect *)effect in: (CALayer *)parent z: (CGFloat)z
+{
+  CALayer *layer = [effect layer];
+
+  if (!layer)
+    return;
+  [layer setFrame: [parent bounds]];
+  [layer setContentsScale: [[self window] backingScaleFactor]];
+  [layer setZPosition: z];
+  /* At the bottom, to leave the tint the image layer's last sublayer;
+     the Z position orders them.  */
+  if ([layer superlayer] != parent)
+    [parent insertSublayer: layer atIndex: 0];
+  [effect setPaused: !([[self window] occlusionState]
+                       & NSWindowOcclusionStateVisible)];
+}
+
+
+/* Place the layers that do not redraw the image: the CRT's pane over
+   the whole frame, and interference over the frame or the image.  */
+- (void)attachOverlays: (CALayer *)frameLayer
+{
+  CALayer *snow = (noiseTarget == 2 ? frameLayer
+                   : noiseTarget == 1 && [backgroundImageLayer superlayer]
+                   ? backgroundImageLayer : nil);
+
+  if (crtTarget != 2 || !frameLayer)
+    ns_drop_effect (&glassEffect);
+  else if (!glassEffect)
+    {
+      EffectUniforms look = { .crt = crtIntensity, .pitch = crtPitch,
+                              .mask = crtMask };
+
+      glassEffect = [[EmacsEffect alloc] initWithImage: nil interval: 0
+                                             intensity: 1 hard: 0 look: look];
+    }
+  [self placeEffect: glassEffect in: frameLayer z: 2];
+
+  if (!snow)
+    ns_drop_effect (&staticEffect);
+  else if (!staticEffect)
+    {
+      /* A pitch of 1 has the shader work in points, not pixels.  */
+      EffectUniforms look = { .noise = noiseIntensity, .pitch = 1 };
+
+      staticEffect = [[EmacsEffect alloc] initWithImage: nil interval: 0
+                                              intensity: 1 hard: 0 look: look];
+    }
+  [self placeEffect: staticEffect in: snow z: noiseTarget == 2 ? 1 : -1];
 }
 
 
@@ -7701,9 +7991,42 @@ glitch_random (void)
   glitchIntensity = intensity;
   glitchHard = hard;
   /* The renderer takes its settings once, so start a new one.  */
-  [backgroundGlitch stop];
-  [backgroundGlitch release];
-  backgroundGlitch = nil;
+  ns_drop_effect (&backgroundEffect);
+  [self attachBackgroundImage];
+}
+
+
+/* TARGET is 0 for no CRT, 1 for the background image, 2 for the whole
+   frame.  INTENSITY and CURVATURE are fractions, PITCH is a scanline's
+   height in points, and MASK is 0 for an aperture grille, 1 for a slot
+   mask, 2 for a shadow mask.  */
+- (void)setCRT: (int)target intensity: (double)intensity
+      scanline: (double)pitch mask: (int)mask curvature: (double)curvature
+{
+  crtTarget = intensity > 0 ? target : 0;
+  crtIntensity = intensity;
+  crtPitch = pitch;
+  crtMask = mask;
+  crtCurve = curvature * 0.5;
+  ns_drop_effect (&backgroundEffect);
+  ns_drop_effect (&glassEffect);
+  [self attachBackgroundImage];
+}
+
+
+/* TARGET is as for the CRT; INTENSITY of 1 is the designed look.  */
+- (void)setInterference: (int)target intensity: (double)intensity
+{
+  noiseTarget = intensity > 0 ? target : 0;
+  noiseIntensity = intensity;
+  ns_drop_effect (&staticEffect);
+  [self attachBackgroundImage];
+}
+
+
+/* Interference need not play to a window nobody can see.  */
+- (void)windowDidChangeOcclusionState: (NSNotification *)notification
+{
   [self attachBackgroundImage];
 }
 
@@ -7729,8 +8052,9 @@ glitch_random (void)
   if (fs_state == FULLSCREEN_BOTH)
     [nonfs_window release];
 
-  [backgroundGlitch stop];
-  [backgroundGlitch release];
+  ns_drop_effect (&backgroundEffect);
+  ns_drop_effect (&glassEffect);
+  ns_drop_effect (&staticEffect);
   [backgroundImageLayer removeFromSuperlayer];
   [backgroundImageLayer release];
   [backgroundImage release];

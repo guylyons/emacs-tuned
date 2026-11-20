@@ -461,7 +461,7 @@ enum ns_return_frame_mode
 
 @class EmacsToolbar;
 @class EmacsLayer;
-@class EmacsGlitch;
+@class EmacsEffect;
 
 #ifdef NS_IMPL_COCOA
 @interface EmacsView : NSView <NSTextInput, NSTextInputClient, NSWindowDelegate>
@@ -484,9 +484,15 @@ enum ns_return_frame_mode
   BOOL fs_is_native;
   NSImage *backgroundImage;
   CALayer *backgroundImageLayer;
-  EmacsGlitch *backgroundGlitch;
+  /* The layers that redraw the image (glitch, CRT), lay a CRT's
+     scanlines and mask over the whole frame, and show interference.  */
+  EmacsEffect *backgroundEffect, *glassEffect, *staticEffect;
   /* `ns-background-glitch' settings; an interval of 0 is off.  */
   double glitchInterval, glitchIntensity, glitchHard;
+  /* `ns-crt' and `ns-interference' settings.  A target is 0 for off,
+     1 for the background image, 2 for the whole frame.  */
+  int crtTarget, crtMask, noiseTarget;
+  double crtIntensity, crtPitch, crtCurve, noiseIntensity;
 @public
   struct frame *emacsframe;
   int scrollbarsNeedingUpdate;
@@ -514,6 +520,9 @@ enum ns_return_frame_mode
 - (void) setBackgroundImage: (NSImage *)image;
 - (void) setBackgroundGlitch: (double)interval intensity: (double)intensity
                         hard: (double)hard;
+- (void) setCRT: (int)target intensity: (double)intensity
+       scanline: (double)pitch mask: (int)mask curvature: (double)curvature;
+- (void) setInterference: (int)target intensity: (double)intensity;
 - (void) attachBackgroundImage;
 #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
 - (void) updateCollectionBehavior;
