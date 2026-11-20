@@ -7280,20 +7280,21 @@ static const char effect_shader[] =
   "  return col * 0.5 / (alpha * g) * w / 3.0;\n"
   "}\n"
   /* The phosphor mask at device pixel PX: an aperture grille (0), slot
-     mask (1) or shadow mask (2), its triads about a scanline wide.
-     Unlit phosphor passes 0.3.  */
+     mask (1) or shadow mask (2).  A triad is two thirds of a scanline
+     wide, as CRT-Royale's 3 pixel triads are to 240 lines on a 1080
+     line display.  Unlit phosphor passes 0.1.  */
   "static float3 mask (float2 px, constant U &u)\n"
   "{\n"
-  "  float w = max (1.0, floor (u.pitch / 3.0 + 0.5));\n"
+  "  float w = max (1.0, floor (u.pitch / 4.5 + 0.5));\n"
   "  float x = px.x, row = floor (px.y / w);\n"
   "  if (u.mask == 2.0)\n"
   "    x += fmod (floor (row / 2.0), 2.0) * 1.5 * w;\n"
   "  float col = floor (x / w);\n"
-  "  float3 m = select (float3 (0.3), float3 (1.0),\n"
+  "  float3 m = select (float3 (0.1), float3 (1.0),\n"
   "                     float3 (fmod (col, 3.0)) == float3 (0.0, 1.0, 2.0));\n"
   "  if (u.mask == 1.0\n"
   "      && fmod (row + 3.0 * fmod (floor (col / 3.0), 2.0), 6.0) < 1.0)\n"
-  "    m *= 0.3;\n"
+  "    m *= 0.1;\n"
   "  return m;\n"
   "}\n"
   /* CRT-Royale's border: dim towards the tube's edge, rounding its
@@ -7316,21 +7317,36 @@ static const char effect_shader[] =
   "    return float4 (0.0, 0.0, 0.0, 1.0);\n"
   /* The two scanlines nearest a pixel light it, in linear light.  */
   "  float rows = u.size.y / u.pitch, y = uv.y * rows - 0.5, k = floor (y);\n"
+  "  float ph = 1.0 / u.pitch;\n"
   "  float4 p0 = picture (float2 (uv.x, (k + 0.5) / rows), u, tex);\n"
   "  float4 p1 = picture (float2 (uv.x, (k + 1.5) / rows), u, tex);\n"
   "  float3 c0 = pow (p0.rgb, float3 (2.5)), c1 = pow (p1.rgb, float3 (2.5));\n"
   "  float3 c = mix (mix (c0, c1, y - k),\n"
-  "                  beam (y - k, c0, 1.0 / u.pitch)\n"
-  "                  + beam (y - k - 1.0, c1, 1.0 / u.pitch), u.crt);\n"
+  "                  beam (y - k, c0, ph) + beam (y - k - 1.0, c1, ph), u.crt);\n"
+  /* The mask passes all the light on the fraction LIT of the screen, a
+     tenth or less elsewhere and the fraction N overall, so the picture
+     is scaled up to keep its brightness.
+     What then overflows a phosphor lights its neighbours in the same
+     colour: CRT-Royale's bloom, here the overflow averaged down the
+     scanline and across a triad instead of blurred.  */
+  "  float lit = u.mask == 1.0 ? 5.0 / 18.0 : 1.0 / 3.0;\n"
+  "  float n = u.mask == 1.0 ? 0.34 : 0.4;\n"
+  "  float hi = mix (1.0, 1.0 / n, u.crt), lo = mix (1.0, 0.1 / n, u.crt);\n"
+  "  float3 bloom = 0.0;\n"
+  "  for (int i = 0; i < 4; i++)\n"
+  "    {\n"
+  "      float t = (i + 0.5) / 4.0;\n"
+  "      float3 b = mix (mix (c0, c1, t),\n"
+  "                      beam (t, c0, ph) + beam (t - 1.0, c1, ph), u.crt);\n"
+  "      bloom += (lit * max (b * hi - 1.0, 0.0)\n"
+  "                + (1.0 - lit) * max (b * lo - 1.0, 0.0)) / 4.0;\n"
+  "    }\n"
+  "  c *= mix (float3 (1.0), mask (in.uv * u.size, u) / n, u.crt);\n"
+  "  c = min (c, 1.0) + bloom;\n"
   /* Diffusion: light scattered in the glass.  */
   "  float3 glow = tex.sample (s, (uv - 0.5) * u.scale + 0.5,\n"
   "                            level (u.lod + 4.0)).rgb;\n"
   "  c = mix (c, pow (glow, float3 (2.5)), 0.075 * u.crt);\n"
-  /* The mask would halve the brightness, so scale it back up and let
-     what overflows a phosphor spill into its neighbours, as bloom does.  */
-  "  c *= mix (float3 (1.0), mask (in.uv * u.size, u)\n"
-  "                          / (u.mask == 1.0 ? 0.4711 : 0.5333), u.crt);\n"
-  "  c = min (c, 1.0) + dot (max (c - 1.0, 0.0), float3 (1.0 / 3.0));\n"
   "  c *= border (uv, u);\n"
   "  float a = max (p0.a, p1.a);\n"
   "  c = pow (c, float3 (1.0 / mix (2.5, 2.2, u.crt)));\n"
@@ -7344,7 +7360,7 @@ static const char effect_shader[] =
   "  float3 grey = float3 (0.5);\n"
   "  float line = (beam (y - k, grey, ph) + beam (y - k - 1.0, grey, ph)).g\n"
   "               / beam (0.0, grey, ph).g;\n"
-  "  float3 m = mix (float3 (1.0), mask (px, u), 0.4 * u.crt)\n"
+  "  float3 m = mix (float3 (1.0), mask (px, u), 0.3 * u.crt)\n"
   "             * mix (1.0, min (line, 1.0), 0.45 * u.crt);\n"
   "  return float4 (m, 1.0);\n"
   "}\n"
@@ -7695,7 +7711,7 @@ glitch_random (void)
       u.scale[1] = u.size[1] / ([texture height] * fill);
       /* The mip level whose texels are a pixel wide, or for a CRT half
          a scanline, since a scanline shows one row of the image.  */
-      u.lod = MAX (0, log2 ((u.crt ? u.pitch / 2 : 1) / fill));
+      u.lod = MAX (0, log2 ((u.crt ? u.pitch : 1) / fill));
     }
   return u;
 }
