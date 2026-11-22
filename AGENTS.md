@@ -60,14 +60,25 @@ Tab bar
   pointer (dragTabGhost: in src/nsterm.m; tab_bar_tab_rect in
   src/xdisp.c gives the tab's rectangle).  Lisp still does the
   reordering when the button comes up, in tab-bar-mouse-move-tab.
+  Dragged below the tab bar, the tab can be dropped on a side of the
+  windows: a translucent block shows the half it would take and
+  settles into place on release.  Within 40 pixels of the outer edge
+  the side is of all the windows, elsewhere of the window under the
+  pointer.  nsterm.m leaves the side in ns-tab-drop-side and the
+  window (nil for all) in ns-tab-drop-window, and
+  tab-bar-mouse-move-tab hands them to
+  tab-bar-merge-tab-at-side (lisp/tab-bar.el), which moves the tab's
+  windows beside the recent tab's and closes it.  The tab under the
+  pointer gets a soft highlight (hoverTab:).
 
 How it is built
 ===============
 
 The effects are Core Animation layers attached to the window's frame
 view (the superview of the content view), ordered by zPosition: the
-background image at -1, the tab drag ghost at 0.5, snow at 1, the CRT
-glass pane at 2.  See
+background image at -1, the tab drop zone at 0.4, the tab hover at
+0.45, the tab drag ghost at 0.5, snow at 1, the CRT glass pane at 2.
+See
 attachOverlays: and placeEffect:in:z: in src/nsterm.m.
 
 EmacsEffect is the one general effect layer: a CAMetalLayer whose

@@ -499,6 +499,11 @@ enum ns_return_frame_mode
   CALayer *tabGhost;
   NSPoint tabPress;
   BOOL tabArmed;
+  /* The side of the windows a dragged tab would split off if dropped
+     now (nil for none), the block that shows it, and the highlight
+     under the tab the pointer is over.  */
+  Lisp_Object tabDropSide;
+  CALayer *tabDropZone, *tabHover;
 @public
   struct frame *emacsframe;
   int scrollbarsNeedingUpdate;
@@ -532,6 +537,8 @@ enum ns_return_frame_mode
 - (void) attachBackgroundImage;
 - (void) dropTabGhost;
 - (void) dragTabGhost: (NSEvent *)e;
+- (void) showTabDrop: (Lisp_Object)side in: (NSRect)r;
+- (void) hoverTab: (NSPoint)p;
 #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
 - (void) updateCollectionBehavior;
 #endif

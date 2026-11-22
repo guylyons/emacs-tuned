@@ -8092,6 +8092,8 @@ ns_drop_effect (EmacsEffect **effect)
     [nonfs_window release];
 
   [self dropTabGhost];
+  [tabHover removeFromSuperlayer];
+  [tabHover release];
   ns_drop_effect (&backgroundEffect);
   ns_drop_effect (&glassEffect);
   ns_drop_effect (&staticEffect);
@@ -9075,19 +9077,260 @@ ns_in_echo_area (void)
 - (void)mouseUp: (NSEvent *)theEvent
 {
   NSTRACE ("[EmacsView mouseUp:]");
+  /* `tab-bar-mouse-move-tab' reads this when the drag event arrives.  */
+  ns_tab_drop_side = tabGhost ? tabDropSide : Qnil;
   [self dropTabGhost];
   [self mouseDown: theEvent];
 }
 
 
-/* Remove the picture of the dragged tab.  */
+/* Fade LAYER out over DURATION seconds, then remove and release it.  */
+static void
+ns_fade_out_layer (CALayer *layer, double duration)
+{
+  if (!layer)
+    return;
+  [CATransaction begin];
+  [CATransaction setAnimationDuration: duration];
+  [CATransaction setCompletionBlock: ^{
+      [layer removeFromSuperlayer];
+      [layer release];
+    }];
+  [layer setOpacity: 0];
+  [CATransaction commit];
+}
+
+
+static BOOL
+ns_reduce_motion (void)
+{
+  return [[NSWorkspace sharedWorkspace] accessibilityDisplayShouldReduceMotion];
+}
+
+
+/* Remove the picture of the dragged tab.  If it was over a drop zone,
+   the zone settles into the pane Lisp is about to make while the
+   picture sinks into it.  */
 - (void)dropTabGhost
 {
+  CALayer *ghost = tabGhost, *zone = tabDropZone;
+
   tabArmed = NO;
-  [tabGhost removeFromSuperlayer];
-  [tabGhost release];
-  tabGhost = nil;
+  tabGhost = tabDropZone = nil;
+  tabDropSide = Qnil;
+  if (!zone)
+    {
+      [ghost removeFromSuperlayer];
+      [ghost release];
+      return;
+    }
+
+  if (!ns_reduce_motion ())
+    {
+      NSRect pane = NSInsetRect ([zone frame], -6, -6);
+
+      [CATransaction begin];
+      [CATransaction setAnimationDuration: 0.32];
+      [CATransaction setAnimationTimingFunction:
+		       [CAMediaTimingFunction functionWithName:
+						kCAMediaTimingFunctionEaseOut]];
+      [zone setFrame: pane];
+      [zone setCornerRadius: 0];
+      [ghost setPosition: CGPointMake (NSMidX (pane), NSMidY (pane))];
+      [ghost setTransform: CATransform3DMakeScale (0.6, 0.6, 1)];
+      [CATransaction commit];
+    }
+  ns_fade_out_layer (zone, 0.32);
+  ns_fade_out_layer (ghost, 0.22);
 }
+
+
+/* Which side of F's windows a tab dropped at view point P would split
+   off: the side nearest P, once P is over the windows.  Near the outer
+   edges of the windows that is a side of them all, elsewhere a side of
+   the window under P.  Store that window, or nil for all of them, in
+   *WINDOW, and the area the new pane would take in *PANE.  */
+static Lisp_Object
+ns_tab_drop_side_at (struct frame *f, NSPoint p, NSRect *pane,
+		     Lisp_Object *window)
+{
+  struct window *w = XWINDOW (FRAME_ROOT_WINDOW (f));
+  NSRect r = NSMakeRect (WINDOW_LEFT_EDGE_X (w), WINDOW_TOP_EDGE_Y (w),
+			 WINDOW_PIXEL_WIDTH (w), WINDOW_PIXEL_HEIGHT (w));
+  NSRect a, b;
+  double u, v;
+
+  *window = Qnil;
+  if (!NSPointInRect (p, r))
+    return Qnil;
+  if (!NSPointInRect (p, NSInsetRect (r, 40, 40)))
+    ;				/* Along the outer edges: all windows.  */
+  else if (WINDOWP (w->contents))
+    {
+      Lisp_Object leaf = window_from_coordinates (f, p.x, p.y, NULL,
+						  false, false, false);
+      if (WINDOW_LIVE_P (leaf) && !MINI_WINDOW_P (XWINDOW (leaf)))
+	{
+	  w = XWINDOW (leaf);
+	  r = NSMakeRect (WINDOW_LEFT_EDGE_X (w), WINDOW_TOP_EDGE_Y (w),
+			  WINDOW_PIXEL_WIDTH (w), WINDOW_PIXEL_HEIGHT (w));
+	  *window = leaf;
+	}
+    }
+  u = (p.x - NSMinX (r)) / NSWidth (r);
+  v = (p.y - NSMinY (r)) / NSHeight (r);
+  if (MIN (u, 1 - u) < MIN (v, 1 - v))
+    {
+      NSDivideRect (r, &a, &b, NSWidth (r) / 2, NSMinXEdge);
+      *pane = u < 0.5 ? a : b;
+      return u < 0.5 ? Qleft : Qright;
+    }
+  /* The view is flipped: NSMinYEdge is the top.  */
+  NSDivideRect (r, &a, &b, NSHeight (r) / 2, NSMinYEdge);
+  *pane = v < 0.5 ? a : b;
+  return v < 0.5 ? Qabove : Qbelow;
+}
+
+
+/* Show where a tab dropped now would go: a translucent block over R,
+   in frame view coordinates, or nothing if SIDE is nil.  The block
+   glides from one side to another as the pointer moves.  */
+- (void)showTabDrop: (Lisp_Object)side in: (NSRect)r
+{
+  NSView *frameView = [[[self window] contentView] superview];
+  BOOL still = ns_reduce_motion ();
+  NSColor *accent;
+
+  if (EQ (side, tabDropSide)
+      && (NILP (side)
+	  || NSEqualRects (NSInsetRect (r, 6, 6), [tabDropZone frame])))
+    return;
+  tabDropSide = side;
+  if (NILP (side))
+    {
+      ns_fade_out_layer (tabDropZone, 0.15);
+      tabDropZone = nil;
+      return;
+    }
+
+  r = NSInsetRect (r, 6, 6);
+  if (tabDropZone)
+    {
+      [CATransaction begin];
+      [CATransaction setDisableActions: still];
+      [CATransaction setAnimationDuration: 0.2];
+      [CATransaction setAnimationTimingFunction:
+		       [CAMediaTimingFunction functionWithControlPoints:
+						0.2 : 0.9 : 0.3 : 1]];
+      [tabDropZone setFrame: r];
+      [CATransaction commit];
+      return;
+    }
+
+  accent = [[NSColor controlAccentColor]
+	     colorUsingColorSpace: [NSColorSpace sRGBColorSpace]];
+  tabDropZone = [[CALayer alloc] init];
+  [CATransaction begin];
+  [CATransaction setDisableActions: YES];
+  [tabDropZone setFrame: r];
+  [tabDropZone setCornerRadius: 10];
+  [tabDropZone setBackgroundColor:
+		 [[accent colorWithAlphaComponent: 0.18] CGColor]];
+  [tabDropZone setBorderColor:
+		 [[accent colorWithAlphaComponent: 0.75] CGColor]];
+  [tabDropZone setBorderWidth: 2];
+  [tabDropZone setShadowColor: [accent CGColor]];
+  [tabDropZone setShadowOpacity: 0.35];
+  [tabDropZone setShadowRadius: 12];
+  [tabDropZone setShadowOffset: CGSizeZero];
+  [tabDropZone setOpacity: 0];
+  if (!still)
+    [tabDropZone setTransform: CATransform3DMakeScale (0.97, 0.97, 1)];
+  /* Over the text, under the dragged tab's picture.  */
+  [tabDropZone setZPosition: 0.4];
+  [[frameView layer] addSublayer: tabDropZone];
+  [CATransaction commit];
+
+  [CATransaction begin];
+  [CATransaction setAnimationDuration: 0.18];
+  [CATransaction setAnimationTimingFunction:
+		   [CAMediaTimingFunction functionWithName:
+					    kCAMediaTimingFunctionEaseOut]];
+  [tabDropZone setOpacity: 1];
+  [tabDropZone setTransform: CATransform3DIdentity];
+  [CATransaction commit];
+}
+
+
+/* Softly light the tab under view point P, or nothing if P is not on
+   a tab or a button is held.  The light slides from tab to tab.
+   shortcut: it follows the pointer only, so it may sit over a stale
+   rectangle when the tab bar changes under a still pointer.  */
+- (void)hoverTab: (NSPoint)p
+{
+  NSView *frameView = [[[self window] contentView] superview];
+  Emacs_Rectangle tab;
+  NSRect r;
+  NSColor *bg;
+  BOOL dark;
+
+  if (tabGhost || [NSEvent pressedMouseButtons] || ![frameView layer]
+      || !NSPointInRect (p, [self bounds])
+      || !tab_bar_tab_rect (emacsframe, lrint (p.x), lrint (p.y), &tab))
+    {
+      if ([tabHover opacity] > 0)
+	{
+	  [CATransaction begin];
+	  [CATransaction setAnimationDuration: 0.2];
+	  [tabHover setOpacity: 0];
+	  [CATransaction commit];
+	}
+      return;
+    }
+
+  r = [self convertRect: NSMakeRect (tab.x, tab.y, tab.width, tab.height)
+		 toView: frameView];
+  r = NSInsetRect (r, 1, 1);
+  if (NSEqualRects (r, [tabHover frame]) && [tabHover opacity] > 0)
+    return;
+
+  bg = [[NSColor colorWithUnsignedLong: FRAME_BACKGROUND_PIXEL (emacsframe)]
+	 colorUsingColorSpace: [NSColorSpace sRGBColorSpace]];
+  dark = (0.3 * [bg redComponent] + 0.59 * [bg greenComponent]
+	  + 0.11 * [bg blueComponent]) < 0.5;
+  if (!tabHover)
+    {
+      tabHover = [[CALayer alloc] init];
+      [CATransaction begin];
+      [CATransaction setDisableActions: YES];
+      [tabHover setCornerRadius: 5];
+      [tabHover setOpacity: 0];
+      [tabHover setZPosition: 0.45];
+      [[frameView layer] addSublayer: tabHover];
+      [CATransaction commit];
+    }
+
+  [CATransaction begin];
+  [CATransaction setDisableActions: YES];
+  [tabHover setBackgroundColor:
+	      [[NSColor colorWithWhite: dark ? 1 : 0
+				 alpha: dark ? 0.08 : 0.06] CGColor]];
+  /* Appearing, it fades in where it is; shown, it slides over.  */
+  if ([tabHover opacity] == 0)
+    [tabHover setFrame: r];
+  [CATransaction commit];
+
+  [CATransaction begin];
+  [CATransaction setDisableActions: ns_reduce_motion ()];
+  [CATransaction setAnimationDuration: 0.14];
+  [tabHover setFrame: r];
+  [CATransaction commit];
+  [CATransaction begin];
+  [CATransaction setAnimationDuration: 0.14];
+  [tabHover setOpacity: 1];
+  [CATransaction commit];
+}
+
 
 
 /* While the left button that went down on a tab is held, carry a
@@ -9138,19 +9381,32 @@ ns_in_echo_area (void)
       [[frameView layer] addSublayer: tabGhost];
       [CATransaction commit];
       CGImageRelease (image);
-      /* From here on, how far into the ghost the pointer holds it.  */
+      /* From here on, how far into the ghost the pointer holds it,
+	 and where the ghost sits on the tab bar.  */
       tabPress.x = ([self convertPoint: tabPress toView: frameView].x
 		    - NSMinX ([tabGhost frame]));
+      tabPress.y = NSMinY ([tabGhost frame]);
     }
 
-  r = [tabGhost frame];
-  r.origin.x = [self convertPoint: p toView: frameView].x - tabPress.x;
-  r.origin.x = MAX (0, MIN (r.origin.x,
-			    NSWidth ([frameView bounds]) - NSWidth (r)));
-  [CATransaction begin];
-  [CATransaction setDisableActions: YES];
-  [tabGhost setFrame: r];
-  [CATransaction commit];
+  {
+    NSPoint q = [self convertPoint: p toView: frameView];
+    NSRect pane;
+    Lisp_Object side = ns_tab_drop_side_at (emacsframe, p, &pane,
+					    &ns_tab_drop_window);
+
+    r = [tabGhost frame];
+    r.origin.x = q.x - tabPress.x;
+    r.origin.x = MAX (0, MIN (r.origin.x,
+			      NSWidth ([frameView bounds]) - NSWidth (r)));
+    /* Over the windows the picture follows the pointer freely, and
+       returns to the tab bar with it.  */
+    r.origin.y = NILP (side) ? tabPress.y : q.y - NSHeight (r) / 2;
+    [CATransaction begin];
+    [CATransaction setDisableActions: YES];
+    [tabGhost setFrame: r];
+    [CATransaction commit];
+    [self showTabDrop: side in: [self convertRect: pane toView: frameView]];
+  }
 #endif
 }
 
@@ -9229,6 +9485,8 @@ ns_in_echo_area (void)
       /* Remember the last window where we saw the mouse.  */
       last_mouse_window = window;
     }
+
+  [self hoverTab: pt];
 
   dragging = (e.type == NSEventTypeLeftMouseDragged);
   if (!ns_note_mouse_movement (emacsframe, pt.x, pt.y, dragging))
@@ -10330,6 +10588,9 @@ static void cancel_ns_deferred_UAZoomChangeFocus_timer ()
   Mouse_HLInfo *hlinfo = emacsframe ? MOUSE_HL_INFO (emacsframe) : NULL;
 
   NSTRACE ("[EmacsView mouseExited:]");
+
+  if (emacsframe)
+    [self hoverTab: NSMakePoint (-1, -1)];
 
   if (!hlinfo)
     return;
@@ -12826,6 +13087,19 @@ syms_of_nsterm (void)
   Fput (Qmeta, Qmodifier_value, make_fixnum (meta_modifier));
   Fput (Qsuper, Qmodifier_value, make_fixnum (super_modifier));
   Fput (Qcontrol, Qmodifier_value, make_fixnum (ctrl_modifier));
+
+ DEFVAR_LISP ("ns-tab-drop-side", ns_tab_drop_side,
+     doc: /* Side of the windows the last dragged tab was dropped on.
+One of `left', `right', `above' or `below', or nil if the tab was not
+dropped over the windows.  Set when the mouse button comes up, for
+`tab-bar-mouse-move-tab'.  */);
+  ns_tab_drop_side = Qnil;
+
+ DEFVAR_LISP ("ns-tab-drop-window", ns_tab_drop_window,
+     doc: /* Window the last dragged tab was dropped beside.
+nil means beside all of the frame's windows.  Meaningful only while
+`ns-tab-drop-side' is non-nil.  */);
+  ns_tab_drop_window = Qnil;
 
  DEFVAR_LISP ("ns-input-font", ns_input_font,
    doc: /* The font specified in the last NS event. */);

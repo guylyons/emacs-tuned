@@ -348,6 +348,8 @@ For any other value of KEY, the value is t."
    (t t)))
 
 (defvar tab-bar--dragging-in-progress)
+(defvar ns-tab-drop-side)
+(defvar ns-tab-drop-window)
 
 (defun tab-bar--event-to-item (posn)
   "Extract extra info from the mouse event at position POSN.
@@ -396,12 +398,13 @@ existing tab."
     (setq tab-bar--dragging-in-progress t)
     ;; Don't close the tab when clicked on the close button.  Also
     ;; don't add new tab on down-mouse.  Let `tab-bar-mouse-1' do this.
+    ;; Tabs too are selected on release, so that dragging one off to a
+    ;; side of the windows leaves the selected tab as the target.
     (unless (or (memq (car item) '(add-tab history-back history-forward global))
-                (nth 2 item))
-      (if (functionp (nth 1 item))
-          (call-interactively (nth 1 item))
-        (unless (eq tab-number t)
-          (tab-bar-select-tab tab-number))))))
+                (nth 2 item)
+                (not (eq tab-number t)))
+      (when (functionp (nth 1 item))
+        (call-interactively (nth 1 item))))))
 
 (defun tab-bar-mouse-1 (event)
   "Close the tab whose \"x\" close button you click.
@@ -416,7 +419,11 @@ regardless of where you click on it.  Also add a new tab."
            (functionp (nth 1 item)))
       (call-interactively (nth 1 item)))
      ((and (nth 2 item) (not (eq tab-number t)))
-      (tab-bar-close-tab tab-number)))))
+      (tab-bar-close-tab tab-number))
+     ((not (eq tab-number t))
+      (if (functionp (nth 1 item))
+          (call-interactively (nth 1 item))
+        (tab-bar-select-tab tab-number))))))
 
 (defun tab-bar-mouse-close-tab (event)
   "Close the tab you click on.
@@ -482,9 +489,15 @@ at the mouse-down event to the position at mouse-up event."
         (to (tab-bar--key-to-number
              (nth 0 (tab-bar--event-to-item
                      (event-end event))))))
-    (unless (or (eq from to) (eq from t) (eq to t))
+    (cond
+     ;; Dropped on a side of the frame's windows (macOS only).
+     ((and (memq (bound-and-true-p ns-tab-drop-side) '(left right above below))
+           (not (eq from t)))
+      (tab-bar-merge-tab-at-side ns-tab-drop-side from
+                                 (bound-and-true-p ns-tab-drop-window)))
+     ((not (or (eq from to) (eq from t) (eq to t)))
       (tab-bar-move-tab-to
-       (if (null to) (1+ (tab-bar--current-tab-index)) to) from))))
+       (if (null to) (1+ (tab-bar--current-tab-index)) to) from)))))
 
 
 
@@ -2040,6 +2053,28 @@ completed successfully and return TAB1."
     tab1))
 
 (defalias 'merge-tabs #'tab-bar-merge-tabs)
+
+(defun tab-bar-merge-tab-at-side (side &optional tab window)
+  "Move the main window of TAB into a split on SIDE of the recent tab.
+SIDE is `left', `right', `above' or `below', as for `split-window'.
+TAB defaults to the selected tab.  The recent tab is the one selected
+before TAB.  Close TAB, unless it is the only tab, in which case
+SIDE shows a copy of its main window instead.  The split is made
+beside WINDOW if that is live in the recent tab and big enough,
+otherwise beside all of its windows."
+  (let (ws)
+    (when tab
+      (tab-bar-select-tab tab))
+    (setq ws (window-state-get (window-main-window)))
+    (when (cdr (funcall tab-bar-tabs-function))
+      (let ((tab-bar-close-tab-select 'recent)
+            (tab-bar-closed-tabs nil))
+        (tab-bar-close-tab)))
+    (window-state-put ws (or (and (window-live-p window)
+                                  (ignore-errors
+                                    (split-window window nil side)))
+                             (split-window (window-main-window) nil side))
+                      'safe)))
 
 
 (defcustom tab-bar-new-tab-to 'right
