@@ -4976,8 +4976,10 @@ ns_draw_glyph_string (struct glyph_string *s)
   if (!s->for_overlaps && !box_drawn_p && s->face->box != FACE_NO_BOX)
     ns_dumpglyphs_box_or_relief (s);
 
+  /* The box was drawn last, over any over- or underline; draw them again.  */
   if (s->face->box != FACE_NO_BOX
-      && s->first_glyph->type == STRETCH_GLYPH)
+      && (s->first_glyph->type == STRETCH_GLYPH
+	  || s->first_glyph->type == IMAGE_GLYPH))
     {
       NSColor *fg_color;
 

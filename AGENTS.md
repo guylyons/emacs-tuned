@@ -60,6 +60,8 @@ Display
   After drawing, the view's layer is displayed and the transaction
   flushed at once, because ns_select_1 skips the AppKit run loop while
   subprocess output is pending and the frame would stay unpainted.
+  An image or stretch in a boxed face draws its underline and overline
+  again after the box, which is painted last and would hide them.
 
 Tab bar
   Dragging a tab carries a picture of it along the tab bar under the
