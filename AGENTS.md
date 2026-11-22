@@ -47,6 +47,12 @@ Frame parameters
                          :target, :intensity, :scanline, :mask,
                          :curvature.
   ns-interference        Television snow.  Plist: :target, :intensity.
+  ns-dim-unfocused       Panes other than the focused one fade into the
+                         frame's background, as Ghostty's unfocused
+                         splits do.  t for 0.3, or a number 0 to 1.
+                         One shape layer with a hole over the focused
+                         pane, updated from ns_update_end
+                         (updatePaneDim in src/nsterm.m).
   The setters are in src/nsfns.m and the parameters are registered in
   src/frame.c.
 
@@ -76,7 +82,8 @@ How it is built
 
 The effects are Core Animation layers attached to the window's frame
 view (the superview of the content view), ordered by zPosition: the
-background image at -1, the tab drop zone at 0.4, the tab hover at
+background image at -1, the unfocused-pane fade at 0.3, the tab drop
+zone at 0.4, the tab hover at
 0.45, the tab drag ghost at 0.5, snow at 1, the CRT glass pane at 2.
 See
 attachOverlays: and placeEffect:in:z: in src/nsterm.m.

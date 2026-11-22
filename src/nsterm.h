@@ -462,6 +462,7 @@ enum ns_return_frame_mode
 @class EmacsToolbar;
 @class EmacsLayer;
 @class EmacsEffect;
+@class CAShapeLayer;
 
 #ifdef NS_IMPL_COCOA
 @interface EmacsView : NSView <NSTextInput, NSTextInputClient, NSWindowDelegate>
@@ -504,6 +505,12 @@ enum ns_return_frame_mode
      under the tab the pointer is over.  */
   Lisp_Object tabDropSide;
   CALayer *tabDropZone, *tabHover;
+  /* `ns-dim-unfocused': how far unfocused panes fade (0 for off), the
+     layer that fades them, and the windows' and the focused pane's
+     rectangles it was last drawn for.  */
+  double paneDimAmount;
+  CAShapeLayer *paneDim;
+  NSRect paneDimAll, paneDimLit;
 @public
   struct frame *emacsframe;
   int scrollbarsNeedingUpdate;
@@ -539,6 +546,8 @@ enum ns_return_frame_mode
 - (void) dragTabGhost: (NSEvent *)e;
 - (void) showTabDrop: (Lisp_Object)side in: (NSRect)r;
 - (void) hoverTab: (NSPoint)p;
+- (void) setPaneDim: (double)amount;
+- (void) updatePaneDim;
 #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
 - (void) updateCollectionBehavior;
 #endif

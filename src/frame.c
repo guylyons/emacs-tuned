@@ -4163,6 +4163,7 @@ static const struct frame_parm_table frame_parms[] =
   {"ns-background-glitch",	SYMBOL_INDEX (Qns_background_glitch)},
   {"ns-crt",			SYMBOL_INDEX (Qns_crt)},
   {"ns-interference",		SYMBOL_INDEX (Qns_interference)},
+  {"ns-dim-unfocused",		SYMBOL_INDEX (Qns_dim_unfocused)},
 #endif
 
   {"display",			SYMBOL_INDEX (Qdisplay)},
@@ -4244,6 +4245,7 @@ enum x_frame_parameter
   NS_BACKGROUND_GLITCH,
   NS_CRT,
   NS_INTERFERENCE,
+  NS_DIM_UNFOCUSED,
 #endif
   DISPLAY,
   LEFT,
@@ -7721,6 +7723,7 @@ syms_of_frame (void)
   DEFSYM (Qns_background_glitch, "ns-background-glitch");
   DEFSYM (Qns_crt, "ns-crt");
   DEFSYM (Qns_interference, "ns-interference");
+  DEFSYM (Qns_dim_unfocused, "ns-dim-unfocused");
 #endif
 
   DEFSYM (Qalpha, "alpha");

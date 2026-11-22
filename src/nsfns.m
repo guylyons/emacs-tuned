@@ -425,6 +425,25 @@ ns_set_interference (struct frame *f, Lisp_Object new_value,
       unblock_input ();
     }
 }
+
+/* Fade every pane of F but the focused one into the background, as
+   Ghostty does its unfocused splits.  NEW_VALUE is nil for off, t for
+   the usual 0.3, or a number from 0 to 1 for how far they fade.  */
+static void
+ns_set_dim_unfocused (struct frame *f, Lisp_Object new_value,
+                      Lisp_Object old_value)
+{
+  EmacsView *view = FRAME_NS_VIEW (f);
+
+  if (view)
+    {
+      block_input ();
+      [view setPaneDim: (NUMBERP (new_value)
+                         ? fmax (0, fmin (XFLOATINT (new_value), 1))
+                         : NILP (new_value) ? 0 : 0.3)];
+      unblock_input ();
+    }
+}
 #endif
 
 
@@ -1258,6 +1277,7 @@ frame_parm_handler ns_frame_parm_handlers[] =
   ns_set_background_glitch,
   ns_set_crt,
   ns_set_interference,
+  ns_set_dim_unfocused,
 #endif
   NULL,
   NULL,
@@ -1702,6 +1722,8 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame,
   gui_default_parameter (f, parms, Qns_crt, Qnil,
                          NULL, NULL, RES_TYPE_BOOLEAN);
   gui_default_parameter (f, parms, Qns_interference, Qnil,
+                         NULL, NULL, RES_TYPE_BOOLEAN);
+  gui_default_parameter (f, parms, Qns_dim_unfocused, Qnil,
                          NULL, NULL, RES_TYPE_BOOLEAN);
 #endif
   gui_default_parameter (f, parms, Qborders_respect_alpha_background, Qnil,

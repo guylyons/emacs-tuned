@@ -1236,6 +1236,7 @@ ns_update_end (struct frame *f)
      ns_select_1 skips while subprocess output is pending.  */
   if ([NSThread isMainThread])
     {
+      [view updatePaneDim];
       [[view layer] display];
       [CATransaction flush];
     }
@@ -8094,6 +8095,8 @@ ns_drop_effect (EmacsEffect **effect)
   [self dropTabGhost];
   [tabHover removeFromSuperlayer];
   [tabHover release];
+  [paneDim removeFromSuperlayer];
+  [paneDim release];
   ns_drop_effect (&backgroundEffect);
   ns_drop_effect (&glassEffect);
   ns_drop_effect (&staticEffect);
@@ -9331,6 +9334,128 @@ ns_tab_drop_side_at (struct frame *f, NSPoint p, NSRect *pane,
   [CATransaction commit];
 }
 
+
+- (void)setPaneDim: (double)amount
+{
+  paneDimAmount = amount;
+  [self updatePaneDim];
+}
+
+
+/* Fade every pane but the focused one into the frame's background
+   (`ns-dim-unfocused'), as Ghostty does its unfocused splits: text,
+   mode lines and what shows through a translucent background all fade
+   alike.  It is one layer over the windows with a hole where the
+   focused pane is, so moving focus slides the hole to the new pane.
+   Called after every redisplay; it does nothing unless that moved.  */
+- (void)updatePaneDim
+{
+  struct frame *f = emacsframe;
+  NSView *frameView = [[[self window] contentView] superview];
+  CALayer *frameLayer = [frameView layer];
+  NSRect all = NSZeroRect, lit = NSZeroRect;
+  struct window *root;
+  Lisp_Object sel;
+  CGMutablePathRef path;
+  CGColorRef fill;
+  BOOL slide;
+
+  if (!f || !frameLayer)
+    return;
+  root = XWINDOW (FRAME_ROOT_WINDOW (f));
+  sel = FRAME_SELECTED_WINDOW (f);
+  /* Typing in the minibuffer leaves its pane in focus.  */
+  if (WINDOW_LIVE_P (sel) && MINI_WINDOW_P (XWINDOW (sel))
+      && WINDOW_LIVE_P (minibuf_selected_window)
+      && XFRAME (WINDOW_FRAME (XWINDOW (minibuf_selected_window))) == f)
+    sel = minibuf_selected_window;
+  /* Only a frame of its own split into panes has any to fade.  */
+  if (paneDimAmount > 0 && !FRAME_PARENT_FRAME (f)
+      && WINDOWP (root->contents)
+      && WINDOW_LIVE_P (sel) && !MINI_WINDOW_P (XWINDOW (sel)))
+    {
+      struct window *w = XWINDOW (sel);
+
+      all = [self convertRect:
+		    NSMakeRect (WINDOW_LEFT_EDGE_X (root),
+				WINDOW_TOP_EDGE_Y (root),
+				WINDOW_PIXEL_WIDTH (root),
+				WINDOW_PIXEL_HEIGHT (root))
+		       toView: frameView];
+      lit = [self convertRect:
+		    NSMakeRect (WINDOW_LEFT_EDGE_X (w), WINDOW_TOP_EDGE_Y (w),
+				WINDOW_PIXEL_WIDTH (w), WINDOW_PIXEL_HEIGHT (w))
+		       toView: frameView];
+    }
+
+  fill = [[[NSColor colorWithUnsignedLong: FRAME_BACKGROUND_PIXEL (f)]
+	    colorWithAlphaComponent: paneDimAmount] CGColor];
+  if (NSEqualRects (all, paneDimAll) && NSEqualRects (lit, paneDimLit)
+      && (NSIsEmptyRect (all) || CGColorEqualToColor ([paneDim fillColor],
+						       fill)))
+    return;
+
+  if (NSIsEmptyRect (all))
+    {
+      paneDimAll = paneDimLit = NSZeroRect;
+      [CATransaction begin];
+      [CATransaction setDisableActions: ns_reduce_motion ()];
+      [CATransaction setAnimationDuration: 0.15];
+      [paneDim setOpacity: 0];
+      [CATransaction commit];
+      return;
+    }
+
+  if (!paneDim)
+    {
+      paneDim = [[CAShapeLayer alloc] init];
+      [paneDim setFillRule: kCAFillRuleEvenOdd];
+      [paneDim setOpacity: 0];
+      /* Over the text, under the tab drop zone and the effects.  */
+      [paneDim setZPosition: 0.3];
+    }
+  /* The hole slides only between panes of the same layout.  */
+  slide = ([paneDim opacity] > 0 && NSEqualRects (all, paneDimAll)
+	   && !ns_reduce_motion ());
+  path = CGPathCreateMutable ();
+  CGPathAddRect (path, NULL, NSRectToCGRect (all));
+  CGPathAddRect (path, NULL, NSRectToCGRect (lit));
+
+  [CATransaction begin];
+  [CATransaction setDisableActions: YES];
+  if ([paneDim superlayer] != frameLayer)
+    {
+      [paneDim removeFromSuperlayer];
+      [frameLayer addSublayer: paneDim];
+    }
+  if (slide)
+    {
+      CABasicAnimation *a = [CABasicAnimation animationWithKeyPath: @"path"];
+      CAShapeLayer *now = [paneDim presentationLayer];
+
+      [a setFromValue: (id) ([now path] ? [now path] : [paneDim path])];
+      [a setDuration: 0.16];
+      [a setTimingFunction: [CAMediaTimingFunction functionWithName:
+						    kCAMediaTimingFunctionEaseOut]];
+      [paneDim addAnimation: a forKey: @"path"];
+    }
+  [paneDim setFrame: [frameLayer bounds]];
+  [paneDim setPath: path];
+  [paneDim setFillColor: fill];
+  [CATransaction commit];
+  CGPathRelease (path);
+
+  if ([paneDim opacity] < 1)
+    {
+      [CATransaction begin];
+      [CATransaction setDisableActions: ns_reduce_motion ()];
+      [CATransaction setAnimationDuration: 0.15];
+      [paneDim setOpacity: 1];
+      [CATransaction commit];
+    }
+  paneDimAll = all;
+  paneDimLit = lit;
+}
 
 
 /* While the left button that went down on a tab is held, carry a
