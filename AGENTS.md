@@ -75,7 +75,10 @@ Tab bar
   tab-bar-mouse-move-tab hands them to
   tab-bar-merge-tab-at-side (lisp/tab-bar.el), which moves the tab's
   windows beside the recent tab's and closes it.  The tab under the
-  pointer gets a soft highlight (hoverTab:).
+  pointer gets a soft highlight (hoverTab:) whose underline, in the
+  cursor colour, flickers in like a torn video signal
+  (ns_glitch_layer).  Tabs and the new-tab button take a pointing
+  hand (tab_bar_hand_p in src/xdisp.c).
 
 How it is built
 ===============

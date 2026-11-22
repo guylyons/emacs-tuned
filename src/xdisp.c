@@ -15376,6 +15376,30 @@ tab_bar_tab_rect (struct frame *f, int x, int y, Emacs_Rectangle *rect)
   return true;
 }
 
+/* Whether frame-relative X/Y on F is over something on the tab bar a
+   click acts on, a tab or the new-tab button, which take a hand.  */
+
+static bool
+tab_bar_hand_p (struct frame *f, int x, int y)
+{
+  Emacs_Rectangle rect;
+  struct glyph *glyph;
+  int hpos, vpos, area, prop_idx;
+  Lisp_Object key;
+
+  if (tab_bar_tab_rect (f, x, y, &rect))
+    return true;
+  if (!WINDOWP (f->tab_bar_window) || !STRINGP (f->current_tab_bar_string))
+    return false;
+  frame_to_window_pixel_xy (XWINDOW (f->tab_bar_window), &x, &y);
+  glyph = x_y_to_hpos_vpos (XWINDOW (f->tab_bar_window), x, y,
+			    &hpos, &vpos, 0, 0, &area);
+  if (glyph == NULL || !tab_bar_item_info (f, glyph, &prop_idx, NULL))
+    return false;
+  key = AREF (f->tab_bar_items, prop_idx + TAB_BAR_ITEM_KEY);
+  return SYMBOLP (key) && strcmp (SSDATA (SYMBOL_NAME (key)), "add-tab") == 0;
+}
+
 /* EXPORT:
    Handle mouse button event on the tab-bar of frame F, at
    frame-relative coordinates X/Y.  DOWN_P is true for a button press,
@@ -37256,7 +37280,7 @@ note_mouse_highlight (struct frame *f, int x, int y)
   if (EQ (window, f->tab_bar_window))
     {
       note_tab_bar_highlight (f, x, y);
-      if (tab_bar__dragging_in_progress)
+      if (tab_bar__dragging_in_progress || tab_bar_hand_p (f, x, y))
 	  cursor = FRAME_OUTPUT_DATA (f)->hand_cursor;
       else
 	cursor = FRAME_OUTPUT_DATA (f)->nontext_cursor;

@@ -9265,8 +9265,42 @@ ns_tab_drop_side_at (struct frame *f, NSPoint p, NSRect *pane,
 }
 
 
+/* Shake LAYER sideways for DURATION seconds in a few hard steps, blinking
+   through the OPACITY values, as a bad video signal tears a line.  */
+static void
+ns_glitch_layer (CALayer *layer, NSArray *opacity, CGFloat reach,
+		 double duration)
+{
+  NSMutableArray *moves = [NSMutableArray array];
+  CAKeyframeAnimation *blink, *shake;
+  CAAnimationGroup *group = [CAAnimationGroup animation];
+  NSUInteger i, n = [opacity count];
+
+  for (i = 0; i < n; i++)
+    {
+      CGFloat dx = (i + 1 == n ? 0
+		    : ((CGFloat) arc4random_uniform (2001) / 1000 - 1) * reach);
+      CGFloat sy = i + 1 == n ? 1 : 1 + arc4random_uniform (3) * 0.5;
+      CATransform3D t = CATransform3DMakeTranslation (dx, 0, 0);
+
+      [moves addObject: [NSValue valueWithCATransform3D:
+				   CATransform3DScale (t, 1, sy, 1)]];
+    }
+  blink = [CAKeyframeAnimation animationWithKeyPath: @"opacity"];
+  [blink setValues: opacity];
+  [blink setCalculationMode: kCAAnimationDiscrete];
+  shake = [CAKeyframeAnimation animationWithKeyPath: @"transform"];
+  [shake setValues: moves];
+  [shake setCalculationMode: kCAAnimationDiscrete];
+  [group setAnimations: @[blink, shake]];
+  [group setDuration: duration];
+  [layer addAnimation: group forKey: @"glitch"];
+}
+
+
 /* Softly light the tab under view point P, or nothing if P is not on
-   a tab or a button is held.  The light slides from tab to tab.
+   a tab or a button is held.  The light slides from tab to tab, and
+   its underline in the cursor colour flickers in on each one.
    shortcut: it follows the pointer only, so it may sit over a stale
    rectangle when the tab bar changes under a still pointer.  */
 - (void)hoverTab: (NSPoint)p
@@ -9274,8 +9308,10 @@ ns_tab_drop_side_at (struct frame *f, NSPoint p, NSRect *pane,
   NSView *frameView = [[[self window] contentView] superview];
   Emacs_Rectangle tab;
   NSRect r;
-  NSColor *bg;
+  NSColor *bg, *accent;
   BOOL dark;
+  CALayer *edge;
+  CGRect line;
 
   if (tabGhost || [NSEvent pressedMouseButtons] || ![frameView layer]
       || !NSPointInRect (p, [self bounds])
@@ -9309,9 +9345,29 @@ ns_tab_drop_side_at (struct frame *f, NSPoint p, NSRect *pane,
       [tabHover setCornerRadius: 5];
       [tabHover setOpacity: 0];
       [tabHover setZPosition: 0.45];
+      /* The underline: an accent line, and a red and a cyan ghost of it
+	 that show only while it glitches.  */
+      edge = [CALayer layer];
+      [edge addSublayer: [CALayer layer]];
+      [edge addSublayer: [CALayer layer]];
+      [edge addSublayer: [CALayer layer]];
+      [[[edge sublayers] objectAtIndex: 0] setBackgroundColor:
+	  [[NSColor colorWithSRGBRed: 1 green: 0.1 blue: 0.3 alpha: 0.8] CGColor]];
+      [[[edge sublayers] objectAtIndex: 1] setBackgroundColor:
+	  [[NSColor colorWithSRGBRed: 0 green: 0.9 blue: 1 alpha: 0.8] CGColor]];
+      [[[edge sublayers] objectAtIndex: 0] setOpacity: 0];
+      [[[edge sublayers] objectAtIndex: 1] setOpacity: 0];
+      [tabHover addSublayer: edge];
       [[frameView layer] addSublayer: tabHover];
       [CATransaction commit];
     }
+  edge = [[tabHover sublayers] firstObject];
+  accent = FRAME_CURSOR_COLOR (emacsframe);
+  if (!accent)
+    accent = [NSColor controlAccentColor];
+  /* Along the bottom of the tab, which is the top in a flipped view.  */
+  line = CGRectMake (4, [frameView isFlipped] ? NSHeight (r) - 2 : 0,
+		     NSWidth (r) - 8, 2);
 
   [CATransaction begin];
   [CATransaction setDisableActions: YES];
@@ -9320,18 +9376,38 @@ ns_tab_drop_side_at (struct frame *f, NSPoint p, NSRect *pane,
 				 alpha: dark ? 0.08 : 0.06] CGColor]];
   /* Appearing, it fades in where it is; shown, it slides over.  */
   if ([tabHover opacity] == 0)
-    [tabHover setFrame: r];
+    {
+      [tabHover setFrame: r];
+      [edge setFrame: line];
+    }
+  [[[edge sublayers] lastObject] setBackgroundColor: [accent CGColor]];
+  for (CALayer *bar in [edge sublayers])
+    [bar setFrame: [edge bounds]];
   [CATransaction commit];
 
   [CATransaction begin];
   [CATransaction setDisableActions: ns_reduce_motion ()];
   [CATransaction setAnimationDuration: 0.14];
   [tabHover setFrame: r];
+  [edge setFrame: line];
+  for (CALayer *bar in [edge sublayers])
+    [bar setFrame: CGRectMake (0, 0, line.size.width, line.size.height)];
   [CATransaction commit];
   [CATransaction begin];
   [CATransaction setAnimationDuration: 0.14];
   [tabHover setOpacity: 1];
   [CATransaction commit];
+
+  /* Arriving on a tab, the underline flickers in like a torn signal.  */
+  if (!ns_reduce_motion ())
+    {
+      ns_glitch_layer ([[edge sublayers] lastObject],
+		       @[@0, @1, @0.2, @1, @0.5, @1], 6, 0.3);
+      ns_glitch_layer ([[edge sublayers] objectAtIndex: 0],
+		       @[@1, @0, @0.8, @0, @0.6, @0], 10, 0.3);
+      ns_glitch_layer ([[edge sublayers] objectAtIndex: 1],
+		       @[@0.8, @1, @0, @0.7, @0, @0], 10, 0.3);
+    }
 }
 
 
