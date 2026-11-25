@@ -500,6 +500,9 @@ enum ns_return_frame_mode
   CALayer *tabGhost;
   NSPoint tabPress;
   BOOL tabArmed;
+  /* The window a row of text is being dragged out of, in place of a
+     tab (see `ns-row-drag').  Empty while a tab is dragged.  */
+  NSRect rowDrag;
   /* The side of the windows a dragged tab would split off if dropped
      now (nil for none), the block that shows it, and the highlight
      under the tab the pointer is over.  */

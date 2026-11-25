@@ -8820,6 +8820,50 @@ ns_in_echo_area (void)
 /*****************************************************************************/
 
 
+/* Whether the text at P in frame F may be dragged out of its window,
+   which is when the window's buffer has `ns-row-drag' set.  If so,
+   set *WINDOW to that window's rectangle and *ROW to that of the row
+   of text at P, both in the view's coordinates.  */
+static bool
+ns_row_drag_at (struct frame *f, NSPoint p, NSRect *window, NSRect *row)
+{
+  enum window_part part;
+  Lisp_Object leaf = window_from_coordinates (f, lrint (p.x), lrint (p.y),
+					      &part, false, false, false);
+  struct window *w;
+  int x, y, width, height;
+
+  /* Only on text, so that the window's edges still resize it.  */
+  if (!WINDOW_LIVE_P (leaf) || part != ON_TEXT)
+    return false;
+  w = XWINDOW (leaf);
+  if (!BUFFERP (w->contents) || !w->current_matrix
+      || NILP (buffer_local_value (Qns_row_drag, w->contents)))
+    return false;
+
+  window_box (w, TEXT_AREA, &x, &y, &width, &height);
+  for (struct glyph_row *r = MATRIX_FIRST_TEXT_ROW (w->current_matrix);
+       r < w->current_matrix->rows + w->current_matrix->nrows
+	 && r->enabled_p && MATRIX_ROW_DISPLAYS_TEXT_P (r);
+       r++)
+    {
+      int top = WINDOW_TO_FRAME_PIXEL_Y (w, r->y);
+
+      if (p.y >= top && p.y < top + r->height)
+	{
+	  *window = NSMakeRect (WINDOW_LEFT_EDGE_X (w), WINDOW_TOP_EDGE_Y (w),
+				WINDOW_PIXEL_WIDTH (w),
+				WINDOW_PIXEL_HEIGHT (w));
+	  *row = NSMakeRect (x, top,
+			     clip_to_bounds (1, r->x + r->pixel_width, width),
+			     r->height);
+	  return true;
+	}
+    }
+  return false;
+}
+
+
 /* This is what happens when the user presses a mouse button.  */
 - (void)mouseDown: (NSEvent *)theEvent
 {
@@ -9038,11 +9082,16 @@ ns_in_echo_area (void)
 	    tab_bar_arg = handle_tab_bar_click (emacsframe, x, y,
 						EV_UDMODIFIERS (theEvent) & down_modifier,
 						EV_MODIFIERS (theEvent) | EV_UDMODIFIERS (theEvent));
-	  if ([theEvent type] == NSEventTypeLeftMouseDown)
-	    {
-	      tabArmed = tab_bar_p;
-	      tabPress = p;
-	    }
+	}
+
+      if ([theEvent type] == NSEventTypeLeftMouseDown)
+	{
+	  NSRect row;
+
+	  rowDrag = NSZeroRect;
+	  tabArmed = (tab_bar_p
+		      || ns_row_drag_at (emacsframe, p, &rowDrag, &row));
+	  tabPress = p;
 	}
 
       if (!(tab_bar_p && NILP (tab_bar_arg)))
@@ -9150,6 +9199,39 @@ ns_reduce_motion (void)
 }
 
 
+/* The main window among WINDOW and its siblings and their children,
+   as `window-main-window' finds it: the last window that is not a
+   side window but has one for a sibling.  nil if there is none.  */
+static Lisp_Object
+ns_main_window (Lisp_Object window)
+{
+  Lisp_Object main = Qnil;
+
+  for (; WINDOWP (window); window = XWINDOW (window)->next)
+    {
+      struct window *w = XWINDOW (window);
+
+      if (MINI_WINDOW_P (w))
+	continue;
+      if (NILP (window_parameter (w, Qwindow_side))
+	  && ((WINDOWP (w->prev)
+	       && !NILP (window_parameter (XWINDOW (w->prev), Qwindow_side)))
+	      || (WINDOWP (w->next)
+		  && !NILP (window_parameter (XWINDOW (w->next),
+					      Qwindow_side)))))
+	main = window;
+      if (WINDOWP (w->contents))
+	{
+	  Lisp_Object sub = ns_main_window (w->contents);
+
+	  if (!NILP (sub))
+	    main = sub;
+	}
+    }
+  return main;
+}
+
+
 /* Which side of F's windows a tab dropped at view point P would split
    off: the side nearest P, once P is over the windows.  Near the outer
    edges of the windows that is a side of them all, elsewhere a side of
@@ -9159,7 +9241,10 @@ static Lisp_Object
 ns_tab_drop_side_at (struct frame *f, NSPoint p, NSRect *pane,
 		     Lisp_Object *window)
 {
-  struct window *w = XWINDOW (FRAME_ROOT_WINDOW (f));
+  /* The main window and not the root, since that is what Lisp splits:
+     side windows are no place to drop.  */
+  Lisp_Object main = ns_main_window (FRAME_ROOT_WINDOW (f));
+  struct window *w = XWINDOW (NILP (main) ? FRAME_ROOT_WINDOW (f) : main);
   NSRect r = NSMakeRect (WINDOW_LEFT_EDGE_X (w), WINDOW_TOP_EDGE_Y (w),
 			 WINDOW_PIXEL_WIDTH (w), WINDOW_PIXEL_HEIGHT (w));
   NSRect a, b;
@@ -9539,12 +9624,14 @@ ns_glitch_layer (CALayer *layer, NSArray *opacity, CGFloat reach,
 /* While the left button that went down on a tab is held, carry a
    picture of that tab along the tab bar under the pointer.  Lisp moves
    the tab itself when the button comes up (`tab-bar-mouse-move-tab');
-   this only shows what is being dragged.  */
+   this only shows what is being dragged.  A row of text in a buffer
+   with `ns-row-drag' set is carried the same way.  */
 - (void)dragTabGhost: (NSEvent *)e
 {
 #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
   NSPoint p = [self convertPoint: [e locationInWindow] fromView: nil];
   NSView *frameView = [[[self window] contentView] superview];
+  BOOL row = !NSIsEmptyRect (rowDrag);
   NSRect r;
 
   if (!tabArmed)
@@ -9557,16 +9644,25 @@ ns_glitch_layer (CALayer *layer, NSArray *opacity, CGFloat reach,
 
       /* Wait for a real drag, by which time redisplay has drawn the
 	 tab as selected.  */
-      if (fabs (p.x - tabPress.x) < 4)
+      if (row
+	  ? hypot (p.x - tabPress.x, p.y - tabPress.y) < 4
+	  : fabs (p.x - tabPress.x) < 4)
 	return;
 
       tabArmed = NO;
       if (![frameView layer]
-	  || ![[self layer] isKindOfClass: [EmacsLayer class]]
-	  || !tab_bar_tab_rect (emacsframe, lrint (tabPress.x),
-				lrint (tabPress.y), &tab))
+	  || ![[self layer] isKindOfClass: [EmacsLayer class]])
 	return;
-      r = NSMakeRect (tab.x, tab.y, tab.width, tab.height);
+      if (row)
+	{
+	  if (!ns_row_drag_at (emacsframe, tabPress, &rowDrag, &r))
+	    return;
+	}
+      else if (tab_bar_tab_rect (emacsframe, lrint (tabPress.x),
+				 lrint (tabPress.y), &tab))
+	r = NSMakeRect (tab.x, tab.y, tab.width, tab.height);
+      else
+	return;
       image = [(EmacsLayer *) [self layer] copyImageOfRect: r];
       if (!image)
 	return;
@@ -9593,17 +9689,23 @@ ns_glitch_layer (CALayer *layer, NSArray *opacity, CGFloat reach,
 
   {
     NSPoint q = [self convertPoint: p toView: frameView];
-    NSRect pane;
-    Lisp_Object side = ns_tab_drop_side_at (emacsframe, p, &pane,
-					    &ns_tab_drop_window);
+    NSRect pane = NSZeroRect;
+    Lisp_Object side = Qnil;
+
+    /* A row has nowhere to drop within its own window, which leaves
+       drags there to the buffer's own commands.  */
+    ns_tab_drop_window = Qnil;
+    if (!NSPointInRect (p, rowDrag))
+      side = ns_tab_drop_side_at (emacsframe, p, &pane, &ns_tab_drop_window);
 
     r = [tabGhost frame];
     r.origin.x = q.x - tabPress.x;
     r.origin.x = MAX (0, MIN (r.origin.x,
 			      NSWidth ([frameView bounds]) - NSWidth (r)));
     /* Over the windows the picture follows the pointer freely, and
-       returns to the tab bar with it.  */
-    r.origin.y = NILP (side) ? tabPress.y : q.y - NSHeight (r) / 2;
+       returns to the tab bar with it.  A row always follows.  */
+    r.origin.y = (row || !NILP (side)
+		  ? q.y - NSHeight (r) / 2 : tabPress.y);
     [CATransaction begin];
     [CATransaction setDisableActions: YES];
     [tabGhost setFrame: r];
@@ -13400,17 +13502,30 @@ syms_of_nsterm (void)
   Fput (Qcontrol, Qmodifier_value, make_fixnum (ctrl_modifier));
 
  DEFVAR_LISP ("ns-tab-drop-side", ns_tab_drop_side,
-     doc: /* Side of the windows the last dragged tab was dropped on.
-One of `left', `right', `above' or `below', or nil if the tab was not
+     doc: /* Side of the windows the last dragged tab or row was dropped on.
+One of `left', `right', `above' or `below', or nil if it was not
 dropped over the windows.  Set when the mouse button comes up, for
-`tab-bar-mouse-move-tab'.  */);
+`tab-bar-mouse-move-tab' and for the command a buffer with
+`ns-row-drag' binds to the drag.  */);
   ns_tab_drop_side = Qnil;
 
  DEFVAR_LISP ("ns-tab-drop-window", ns_tab_drop_window,
-     doc: /* Window the last dragged tab was dropped beside.
+     doc: /* Window the last dragged tab or row was dropped beside.
 nil means beside all of the frame's windows.  Meaningful only while
 `ns-tab-drop-side' is non-nil.  */);
   ns_tab_drop_window = Qnil;
+
+ DEFVAR_LISP ("ns-row-drag", ns_row_drag,
+     doc: /* Non-nil means a row of this buffer's text can be dragged out.
+Dragging with the left button from a row carries a picture of the row
+under the pointer and, outside the buffer's own window, shows where
+among the other windows it would be dropped, as for a dragged tab.
+The drag still arrives as an ordinary `drag-mouse-1' event; the
+command bound to it finds the place in `ns-tab-drop-side' and
+`ns-tab-drop-window'.  Set it with `setq-local'.  */);
+  ns_row_drag = Qnil;
+  DEFSYM (Qns_row_drag, "ns-row-drag");
+  DEFSYM (Qwindow_side, "window-side");
 
  DEFVAR_LISP ("ns-input-font", ns_input_font,
    doc: /* The font specified in the last NS event. */);

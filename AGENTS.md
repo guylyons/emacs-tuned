@@ -81,6 +81,13 @@ Tab bar
   cursor colour, flickers in like a torn video signal
   (ns_glitch_layer).  Tabs and the new-tab button take a pointing
   hand (tab_bar_hand_p in src/xdisp.c).
+  The windows meant are the main window's (ns_main_window): side
+  windows are no place to drop.
+  A row of text is dragged the same way out of a buffer that sets
+  ns-row-drag with setq-local, a file tree for one (ns_row_drag_at).
+  No drop zone shows over the buffer's own window.  The drag arrives
+  as drag-mouse-1 and the buffer's own command reads ns-tab-drop-side
+  and ns-tab-drop-window; nothing in the fork knows what a row means.
 
 How it is built
 ===============
