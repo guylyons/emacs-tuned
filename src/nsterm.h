@@ -459,6 +459,10 @@ enum ns_return_frame_mode
 
    ========================================================================== */
 
+/* The kinds of burst `ns-background-glitch' may ask for.  */
+enum { GLITCH_DRIFT = 1, GLITCH_HARD = 2, GLITCH_ZOOM = 4, GLITCH_SCROLL = 8,
+       GLITCH_ALL = 15 };
+
 @class EmacsToolbar;
 @class EmacsLayer;
 @class EmacsEffect;
@@ -485,14 +489,17 @@ enum ns_return_frame_mode
   BOOL fs_is_native;
   NSImage *backgroundImage;
   CALayer *backgroundImageLayer;
+  /* 1 - `ns-background-image-alpha', so that 0 is opaque.  */
+  double backgroundImageFade;
   /* The layers that redraw the image (glitch, CRT), lay a CRT's
      scanlines and mask over the whole frame, and show interference.  */
   EmacsEffect *backgroundEffect, *glassEffect, *staticEffect;
   /* `ns-background-glitch' settings; an interval of 0 is off.  */
-  double glitchInterval, glitchIntensity, glitchHard;
+  double glitchInterval, glitchIntensity;
+  int glitchKinds;
   /* `ns-crt' and `ns-interference' settings.  A target is 0 for off,
      1 for the background image, 2 for the whole frame.  */
-  int crtTarget, crtMask, noiseTarget;
+  int crtTarget, crtMask, crtKind, noiseTarget;
   double crtIntensity, crtPitch, crtCurve, noiseIntensity;
   /* A picture of the tab being dragged along the tab bar, the point
      where the button went down on it, and whether a drag from there
@@ -539,10 +546,12 @@ enum ns_return_frame_mode
 - (BOOL) fsIsNative;
 - (BOOL) isFullscreen;
 - (void) setBackgroundImage: (NSImage *)image;
+- (void) setBackgroundImageAlpha: (double)alpha;
 - (void) setBackgroundGlitch: (double)interval intensity: (double)intensity
-                        hard: (double)hard;
+                       kinds: (int)which;
 - (void) setCRT: (int)target intensity: (double)intensity
-       scanline: (double)pitch mask: (int)mask curvature: (double)curvature;
+       scanline: (double)pitch mask: (int)mask curvature: (double)curvature
+           kind: (int)kind;
 - (void) setInterference: (int)target intensity: (double)intensity;
 - (void) attachBackgroundImage;
 - (void) dropTabGhost;
@@ -1067,6 +1076,14 @@ struct ns_output
 
   /* Non-zero if we are doing an animation, e.g. toggling the tool bar.  */
   int in_animation;
+
+  /* `ns-text-shadow': the blur, in points, of the halo drawn under
+     text over a translucent background (0 for none), its strength as a
+     fraction of the default, and its colour if not each face's
+     background.  */
+  double text_shadow, text_shadow_strength;
+  unsigned long text_shadow_color;
+  bool text_shadow_color_p;
 
 #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
   /* Is the frame double buffered?  */

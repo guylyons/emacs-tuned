@@ -3101,9 +3101,53 @@ macfont_draw (struct glyph_string *s, int from, int to, int x, int y,
           CGContextSetFontSmoothingStyle(context, 16);
         }
 
+      /* `ns-text-shadow': a halo, by default in the face's background
+         colour, which the text was chosen to be read against.  The
+         glyphs of the halo passes are drawn far off to the side and
+         only their shadow is moved back under the text, so the text
+         itself is drawn once and keeps its weight.  */
+      struct ns_output *out = FRAME_OUTPUT_DATA (f);
+      int passes = 1, halo_passes = 0;
+      /* Further than any surface is wide.  */
+      const CGFloat away = 100000;
+      CGSize offset = CGSizeZero;
+      if (out->text_shadow > 0 && out->text_shadow_strength > 0
+          && f->alpha_background < 1.0 && s->hl != DRAW_CURSOR && face)
+        {
+          /* At the default strength, two blurred copies: one is too
+             faint to read against.  */
+          double copies = 2 * out->text_shadow_strength;
+          halo_passes = ceil (copies);
+          passes = halo_passes + 1;
+          CGColorRef halo = get_cgcolor_alpha (out->text_shadow_color_p
+                                               ? out->text_shadow_color
+                                               : NS_FACE_BACKGROUND (face),
+                                               copies / halo_passes);
+          /* A shadow is measured in device pixels, whatever the CTM.  */
+          CGSize blur = CGContextConvertSizeToDeviceSpace
+            (context, CGSizeMake (out->text_shadow, 0));
+
+          offset = CGContextConvertSizeToDeviceSpace
+            (context, CGSizeMake (away, 0));
+          CGContextSetShadowWithColor (context,
+                                       CGSizeMake (-offset.width,
+                                                   -offset.height),
+                                       fabs (blur.width), halo);
+          CGColorRelease (halo);
+          CGContextTranslateCTM (context, away, 0);
+        }
+
       CGContextSetTextMatrix (context, atfm);
       CGContextSetTextPosition (context, text_position.x, text_position.y);
 
+      while (passes-- > 0)
+      {
+        if (halo_passes && passes == 0)
+          {
+            /* The text itself, in place and without a shadow.  */
+            CGContextTranslateCTM (context, -away, 0);
+            CGContextSetShadowWithColor (context, CGSizeZero, 0, NULL);
+          }
 #if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
       if (macfont_info->color_bitmap_p
 #if MAC_OS_X_VERSION_MIN_REQUIRED < 1070
@@ -3124,6 +3168,7 @@ macfont_draw (struct glyph_string *s, int from, int to, int x, int y,
           CGContextSetFontSize (context, font_size);
           CGContextShowGlyphsAtPositions (context, glyphs, positions, len);
         }
+      }
     }
 
 

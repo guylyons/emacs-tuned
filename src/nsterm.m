@@ -7188,7 +7188,8 @@ static const char effect_shader[] =
   "struct V { float4 pos [[position]]; float2 uv; };\n"
   "struct U { float2 size, scale;\n"
   "           float time, seed, focus, split, tear, blocks, noise, lod;\n"
-  "           float crt, pitch, mask, curve; };\n"
+  "           float crt, pitch, mask, curve, zoom, scroll, kind, pad;\n"
+  "           float2 centre; };\n"
   "constexpr sampler s (filter::linear, mip_filter::linear,\n"
   "                     s_address::repeat, t_address::clamp_to_edge);\n"
   "static float hash (float a, float b, float c)\n"
@@ -7211,7 +7212,9 @@ static const char effect_shader[] =
      CRT samples whole scanlines, which have no useful derivative.  */
   "static float4 picture (float2 uv0, constant U &u, texture2d<float> tex)\n"
   "{\n"
-  "  float2 px = uv0 * u.size, uv = uv0;\n"
+  "  float2 px = uv0 * u.size;\n"
+  /* Zoomed in on a point, which stays where it is.  */
+  "  float2 uv = u.centre + (uv0 - u.centre) / (1.0 + u.zoom);\n"
   /* Tearing: bands of rows slide sideways, plus the odd hairline.  */
   "  float band = floor (uv.y * mix (6.0, 40.0, hash (u.seed, 1, 0))\n"
   "                      + hash (u.seed, 2, 0));\n"
@@ -7240,6 +7243,8 @@ static const char effect_shader[] =
   /* Defocus and chromatic split.  SCALE maps the window onto the
      image as `kCAGravityResizeAspectFill' does.  */
   "  float2 tuv = (uv - 0.5) * u.scale + 0.5, texel = u.scale / u.size;\n"
+  /* Scrolled right by a number of image widths; the sampler repeats.  */
+  "  tuv.x -= u.scroll;\n"
   "  float2 ca = (float2 (1.0, 0.2) * 12.0 * texel\n"
   "               + (uv - 0.5) * 0.015 * u.scale) * u.split;\n"
   "  float radius = u.focus * 16.0;\n"
@@ -7331,11 +7336,157 @@ static const char effect_shader[] =
   "  float pen = length (max (0.015 - e, 0.0)) / 0.015;\n"
   "  return min (pow (max (1.0 - pen, 0.0), 2.0) * 2.5, 1.0);\n"
   "}\n"
+  /* CRT-Lottes (crt/shaders/crt-lottes.glsl in libretro's glsl-shaders,
+     by Timothy Lottes, public domain), with its default settings.  The
+     emulated pixels are a scanline square.  Its sRGB conversions are
+     kept, as are its kernels: three rows of 3, 5 and 3 pixels for the
+     picture and five of 5 and 7 for the bloom.  */
+  "static float3 lfetch (float2 pos, float2 off, float2 src, constant U &u,\n"
+  "                      texture2d<float> tex)\n"
+  "{\n"
+  "  float3 c = picture ((floor (pos * src + off) + 0.5) / src, u, tex).rgb;\n"
+  "  return select (pow ((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);\n"
+  "}\n"
+  "static float lgaus (float x, float scale) { return exp2 (scale * x * x); }\n"
+  "static float3 lhorz (float2 pos, float row, int n, float hard, float2 src,\n"
+  "                     constant U &u, texture2d<float> tex)\n"
+  "{\n"
+  "  float dst = 0.5 - fract (pos.x * src.x), w = 0.0;\n"
+  "  float3 c = 0.0;\n"
+  "  for (int i = -n; i <= n; i++)\n"
+  "    {\n"
+  "      float k = lgaus (dst + i, hard);\n"
+  "      c += lfetch (pos, float2 (i, row), src, u, tex) * k;\n"
+  "      w += k;\n"
+  "    }\n"
+  "  return c / w;\n"
+  "}\n"
+  /* Lottes's masks at device pixel PX: 2 an aperture grille, 1 a slot
+     mask, 3 a shadow mask, all 0.5 dark and 1.5 light.  */
+  "static float3 lmask (float2 px, float type)\n"
+  "{\n"
+  "  float x = px.x;\n"
+  "  if (type == 3.0)\n"
+  "    x += px.y * 3.0;\n"
+  "  float t = fract (x / (type == 3.0 ? 6.0 : 3.0));\n"
+  "  float3 m = 0.5;\n"
+  "  m[t < 0.333 ? 0 : t < 0.666 ? 1 : 2] = 1.5;\n"
+  "  if (type == 1.0)\n"
+  "    m *= fract ((px.y + (fract (px.x / 6.0) < 0.5 ? 1.0 : 0.0)) * 0.5) < 0.5\n"
+  "         ? 0.5 : 1.5;\n"
+  "  return m;\n"
+  "}\n"
+  "static float lmasktype (constant U &u)\n"
+  "{\n"
+  "  return u.mask == 0.0 ? 2.0 : u.mask == 2.0 ? 3.0 : 1.0;\n"
+  "}\n"
+  "static float4 lottes (float2 uv0, constant U &u, texture2d<float> tex)\n"
+  "{\n"
+  /* Lottes's warp at a curvature of 25%.  */
+  "  float2 p = uv0 * 2.0 - 1.0;\n"
+  "  p *= 1.0 + p.yx * p.yx * float2 (0.031, 0.041) * u.curve * 8.0;\n"
+  "  float2 pos = p * 0.5 + 0.5;\n"
+  "  if (any (pos != saturate (pos)))\n"
+  "    return float4 (0.0, 0.0, 0.0, 1.0);\n"
+  "  float2 src = u.size / u.pitch;\n"
+  "  float dy = 0.5 - fract (pos.y * src.y);\n"
+  "  float3 c = 0.0, b = 0.0;\n"
+  "  for (int j = -1; j <= 1; j++)\n"
+  "    c += lhorz (pos, j, j ? 1 : 2, -3.0, src, u, tex) * lgaus (dy + j, -8.0);\n"
+  "  for (int j = -2; j <= 2; j++)\n"
+  "    b += lhorz (pos, j, abs (j) == 2 ? 2 : 3, abs (j) == 2 ? -3.0 : -1.5,\n"
+  "                src, u, tex) * lgaus (dy + j, -2.0);\n"
+  "  c = (c + b * 0.15) * lmask (uv0 * u.size, lmasktype (u));\n"
+  "  float4 flat = picture (pos, u, tex);\n"
+  "  c = select (1.055 * pow (c, 0.41666) - 0.055, c * 12.92, c < 0.0031308);\n"
+  "  c = mix (flat.rgb, c, u.crt);\n"
+  "  return float4 (clamp (c, 0.0, flat.a), flat.a);\n"
+  "}\n"
+  /* NewPixie (crt/shaders/newpixie/newpixie-crt.slang in libretro's
+     slang-shaders, by Mattias Gustavsson, after Ryan Kennedy's MIT
+     licensed crt-pi): curved glass, colour bleed, ghosting, a rolling
+     scanline, a filmic tone curve, vignette, noise and flicker.  It
+     works with y up, as GL does.  Its ghosting blurs the image in
+     passes of its own; here a blurrier mip level stands in.  */
+  "static float3 psample (float2 tc, constant U &u, texture2d<float> tex)\n"
+  "{\n"
+  "  tc = tc * float2 (1.025, 0.92) + float2 (-0.0125, 0.04);\n"
+  "  return pow (picture (float2 (tc.x, 1.0 - tc.y), u, tex).rgb, 2.2) * 1.25;\n"
+  "}\n"
+  "static float3 pghost (float2 tc, constant U &u, texture2d<float> tex)\n"
+  "{\n"
+  "  tc = tc * float2 (1.025, 0.92) + float2 (-0.0125, 0.04);\n"
+  "  tc = (float2 (tc.x, 1.0 - tc.y) - 0.5) * u.scale + 0.5;\n"
+  "  return pow (tex.sample (s, tc, level (u.lod + 3.0)).rgb, 2.2) * 1.25;\n"
+  "}\n"
+  "static float2 pcurve (float2 uv, float k)\n"
+  "{\n"
+  "  uv = (uv - 0.5) * float2 (0.925, 1.095) * k;\n"
+  "  uv.x *= 1.0 + pow (abs (uv.y) / 4.0, 2.0);\n"
+  "  uv.y *= 1.0 + pow (abs (uv.x) / 3.0, 2.0);\n"
+  "  return (uv / k + 0.5) * 0.92 + 0.04;\n"
+  "}\n"
+  "static float prand (float2 co)\n"
+  "{\n"
+  "  return fract (sin (dot (co, float2 (12.9898, 78.233))) * 43758.5453);\n"
+  "}\n"
+  /* Its time counts frames at 60 a second, which its rolling scanline
+     and flicker turn by whole radians: those become rates per second
+     with the same apparent motion.  F is the scanlines' angular
+     frequency per pixel, 1.5 in the original.  */
+  "static float4 newpixie (float2 uv0, constant U &u, texture2d<float> tex)\n"
+  "{\n"
+  "  float2 uv = float2 (uv0.x, 1.0 - uv0.y), px = uv * u.size;\n"
+  "  float fr = fmod (floor (u.time * 60.0), 640.0), f = 6.2832 / u.pitch;\n"
+  "  float2 cu = mix (pcurve (uv, max (u.curve * 8.0, 0.0001)), uv, 0.4);\n"
+  "  float2 sc = cu * 1.101 - 0.0505 + float2 (0.003, -0.001);\n"
+  "  float x = sin (px.y * f) / u.size.x * 0.25;\n"
+  "  float3 col = float3 (psample (float2 (x + sc.x + 0.0009, sc.y + 0.0009), u, tex).r,\n"
+  "                       psample (float2 (x + sc.x, sc.y - 0.0011), u, tex).g,\n"
+  "                       psample (float2 (x + sc.x - 0.0015, sc.y), u, tex).b)\n"
+  "               + 0.02;\n"
+  "  float i = saturate (dot (col, float3 (0.299, 0.587, 0.114)));\n"
+  "  i = i * i * 0.85 + 0.15;\n"
+  "  float3 r = pghost (float2 (x - 0.014, -0.027) * 0.85\n"
+  "                     + 0.007 * float2 (0.35 * sin (1.0 / 7.0 + 15.0 * cu.y + 0.9 * fr),\n"
+  "                                       0.35 * sin (2.0 / 7.0 + 10.0 * cu.y + 1.37 * fr))\n"
+  "                     + sc + 0.001, u, tex) * float3 (0.5, 0.25, 0.25);\n"
+  "  float3 g = pghost (float2 (x - 0.019, -0.020) * 0.85\n"
+  "                     + 0.007 * float2 (0.35 * cos (1.0 / 9.0 + 15.0 * cu.y + 0.5 * fr),\n"
+  "                                       0.35 * sin (2.0 / 9.0 + 10.0 * cu.y + 1.5 * fr))\n"
+  "                     + sc + float2 (0.0, -0.002), u, tex) * float3 (0.25, 0.5, 0.25);\n"
+  "  float3 b = pghost (float2 (x - 0.017, -0.003) * 0.85\n"
+  "                     + 0.007 * float2 (0.35 * sin (2.0 / 3.0 + 15.0 * cu.y + 0.7 * fr),\n"
+  "                                       0.35 * cos (2.0 / 3.0 + 10.0 * cu.y + 1.63 * fr))\n"
+  "                     + sc + float2 (-0.002, 0.0), u, tex) * float3 (0.25, 0.25, 0.5);\n"
+  "  col += 0.15 * (1.0 - 0.299) * pow (saturate (3.0 * r), 2.0) * i;\n"
+  "  col += 0.15 * (1.0 - 0.587) * pow (saturate (3.0 * g), 2.0) * i;\n"
+  "  col += 0.15 * (1.0 - 0.114) * pow (saturate (3.0 * b), 2.0) * i;\n"
+  "  col *= float3 (0.95, 1.05, 0.95);\n"
+  "  col = clamp (col * 1.3 + 0.75 * col * col + 1.25 * pow (col, 5.0), 0.0, 10.0);\n"
+  "  col *= 1.3 * sqrt (0.01 + 16.0 * cu.x * cu.y * (1.0 - cu.x) * (1.0 - cu.y));\n"
+  "  col *= pow (saturate (0.35 + 0.18 * sin (-16.99 * u.time - cu.y * u.size.y * f)),\n"
+  "              0.9);\n"
+  "  col *= 1.0 - 0.23 * saturate (fmod (px.x, 3.0) / 2.0);\n"
+  "  float3 xx = max (col - 0.004, 0.0);\n"
+  "  col = xx * (6.2 * xx + 0.5) / (xx * (6.2 * xx + 1.7) + 0.06);\n"
+  "  float2 seed = cu * u.size;\n"
+  "  col -= 0.015 * pow (float3 (prand (seed + fr), prand (seed + fr * 2.0),\n"
+  "                              prand (seed + fr * 3.0)), 1.5);\n"
+  "  col *= 1.0 - 0.004 * (sin (-15.93 * u.time + cu.y * 2.0) * 0.5 + 0.5);\n"
+  "  float4 flat = picture (uv0, u, tex);\n"
+  "  col = mix (flat.rgb, col, u.crt);\n"
+  "  return float4 (clamp (col, 0.0, flat.a), flat.a);\n"
+  "}\n"
   "fragment float4 fmain (V in [[stage_in]], constant U &u [[buffer (0)]],\n"
   "                       texture2d<float> tex [[texture (0)]])\n"
   "{\n"
   "  if (u.crt <= 0.0)\n"
   "    return picture (in.uv, u, tex);\n"
+  "  if (u.kind == 1.0)\n"
+  "    return lottes (in.uv, u, tex);\n"
+  "  if (u.kind == 2.0)\n"
+  "    return newpixie (in.uv, u, tex);\n"
   /* Bulge like a tube, keeping the middle of each edge in place.  */
   "  float2 d = in.uv - 0.5;\n"
   "  float2 uv = 0.5 + d * (1.0 + u.curve * dot (d, d)) / (1.0 + u.curve * 0.25);\n"
@@ -7382,6 +7533,30 @@ static const char effect_shader[] =
   "fragment float4 fglass (V in [[stage_in]], constant U &u [[buffer (0)]])\n"
   "{\n"
   "  float2 px = in.uv * u.size;\n"
+  /* Lottes's scanlines on a flat field, and its mask.  */
+  "  if (u.kind == 1.0)\n"
+  "    {\n"
+  "      float dy = 0.5 - fract (px.y / u.pitch), line = 0.0;\n"
+  "      for (int j = -1; j <= 1; j++)\n"
+  "        line += lgaus (dy + j, -8.0);\n"
+  "      return float4 (mix (float3 (1.0), lmask (px, lmasktype (u)) / 1.5,\n"
+  "                          0.3 * u.crt)\n"
+  "                     * mix (1.0, min (line, 1.0), 0.45 * u.crt), 1.0);\n"
+  "    }\n"
+  /* NewPixie's rolling scanline, mask and vignette.  */
+  "  if (u.kind == 2.0)\n"
+  "    {\n"
+  "      float f = 6.2832 / u.pitch, y = 1.0 - in.uv.y;\n"
+  "      float line = pow (saturate (0.35 + 0.18 * sin (-16.99 * u.time\n"
+  "                                                     - y * u.size.y * f)),\n"
+  "                        0.9) / 0.53;\n"
+  "      float vig = 1.3 * sqrt (0.01 + 16.0 * in.uv.x * in.uv.y\n"
+  "                                     * (1.0 - in.uv.x) * (1.0 - in.uv.y));\n"
+  "      return float4 (float3 (mix (1.0, line, 0.45 * u.crt)\n"
+  "                             * mix (1.0, 1.0 - 0.23 * saturate (fmod (px.x, 3.0)\n"
+  "                                                                / 2.0), u.crt)\n"
+  "                             * mix (1.0, min (vig, 1.0), u.crt)), 1.0);\n"
+  "    }\n"
   "  float y = px.y / u.pitch - 0.5, k = floor (y), ph = 1.0 / u.pitch;\n"
   "  float3 grey = float3 (0.5);\n"
   "  float line = (beam (y - k, grey, ph) + beam (y - k - 1.0, grey, ph)).g\n"
@@ -7433,7 +7608,9 @@ typedef struct
 {
   float size[2], scale[2];
   float time, seed, focus, split, tear, blocks, noise, lod;
-  float crt, pitch, mask, curve;
+  /* KIND is the CRT's look: 0 CRT-Royale, 1 CRT-Lottes, 2 NewPixie.  */
+  float crt, pitch, mask, curve, zoom, scroll, kind, pad;
+  float centre[2];
 } EffectUniforms;
 
 static double
@@ -7476,7 +7653,8 @@ glitch_random (void)
   id<MTLRenderPipelineState> pipeline;
   id<MTLTexture> texture;
   atomic_bool stopped, paused;
-  double interval, intensity, hardChance;
+  double interval, intensity;
+  int kinds;
   EffectUniforms look;
   CGSize drawableSize;
   CGFloat drawableScale;
@@ -7488,11 +7666,11 @@ glitch_random (void)
 
 /* With an image this draws the image: INTERVAL is the mean number of
    seconds between glitch bursts (0 for none), INTENSITY scales every
-   glitch (1 is the designed look), HARD is the chance a burst is a
-   hard glitch rather than a drift, and U.crt makes it a CRT.  Without
+   glitch (1 is the designed look), WHICH is the kinds of burst there
+   may be (GLITCH_DRIFT and so on, ored), and U.crt makes it a CRT.  Without
    one it draws interference if U.noise, else the CRT's pane.  */
 - (instancetype)initWithImage: (NSImage *)img interval: (double)secs
-                    intensity: (double)scale hard: (double)chance
+                    intensity: (double)scale kinds: (int)which
                          look: (EffectUniforms)u
 {
   id<MTLDevice> device = MTLCreateSystemDefaultDevice ();
@@ -7509,7 +7687,7 @@ glitch_random (void)
   image = [img retain];
   interval = secs;
   intensity = scale;
-  hardChance = chance;
+  kinds = which;
   look = u;
   cgimage = CGImageRetain (cg);
   /* Match the static image's colours exactly.  */
@@ -7647,7 +7825,9 @@ glitch_random (void)
 
   /* A CRT and interference stay up, where a glitch shows only during
      its bursts, and only interference moves in between.  */
-  BOOL steady = !image || look.crt, moving = !image && look.noise;
+  BOOL steady = !image || look.crt;
+  /* NewPixie's scanline rolls and its noise crawls.  */
+  BOOL moving = (!image && look.noise) || (look.crt && look.kind == 2);
   double tick = steady ? 1.0 / 30 : 0.1;
   /* Long quiet spells keep a glitch rare enough to land.  */
   double rest = interval * (0.45 + glitch_random () * 1.1);
@@ -7737,7 +7917,7 @@ glitch_random (void)
       u.scale[1] = u.size[1] / ([texture height] * fill);
       /* The mip level whose texels are a pixel wide, or for a CRT half
          a scanline, since a scanline shows one row of the image.  */
-      u.lod = MAX (0, log2 ((u.crt ? u.pitch : 1) / fill));
+      u.lod = MAX (0, log2 ((u.crt && u.kind != 2 ? u.pitch : 1) / fill));
     }
   return u;
 }
@@ -7780,9 +7960,11 @@ glitch_random (void)
     }
 }
 
-/* One event: a drift out of focus and back, or a hard glitch whose
+/* One event: a drift out of focus and back; a hard glitch whose
    broken frames hold and jump like a failing decoder's, after which
-   the lens hunts back into focus.  */
+   the lens hunts back into focus; a zoom in on some point of the
+   image and out again; or a scroll, in which the image runs off to
+   the right, comes round from the left and bounces into place.  */
 - (void)burst
 {
   [self performSelectorOnMainThread: @selector (fitDrawable)
@@ -7794,9 +7976,25 @@ glitch_random (void)
   if (u.size[0] < 1 || u.size[1] < 1)
     return;
 
-  BOOL hard = glitch_random () < hardChance;
-  double len = hard ? 0.3 + glitch_random () * 0.9 : 1.8 + glitch_random () * 1.8;
+  int kind;
+
+  if (!(kinds & GLITCH_ALL))
+    return;
+  do
+    kind = 1 << arc4random_uniform (4);
+  while (!(kinds & kind));
+
+  BOOL hard = kind == GLITCH_HARD;
+  double len = (hard ? 0.3 + glitch_random () * 0.9
+                : kind == GLITCH_ZOOM ? 2.5 + glitch_random () * 2.5
+                : kind == GLITCH_SCROLL ? 1.6 + glitch_random () * 0.8
+                : 1.8 + glitch_random () * 1.8);
   double settle = hard ? 0.7 : 0;
+  /* How far a zoom magnifies, less one.  */
+  double reach = (0.4 + glitch_random () * 1.2) * intensity;
+
+  u.centre[0] = 0.15 + glitch_random () * 0.7;
+  u.centre[1] = 0.15 + glitch_random () * 0.7;
   double depth = 0.5 + glitch_random () * 0.5;
   /* A drift sometimes cracks for a few frames at its softest.  */
   double flick = (!hard && glitch_random () < 0.4
@@ -7808,7 +8006,28 @@ glitch_random (void)
        t = CACurrentMediaTime () - start)
     {
       u.time = t;
-      if (hard && t < len)
+      if (kind == GLITCH_ZOOM)
+        {
+          /* In quickly, a slow creep closer, out quickly.  */
+          double p = t / len;
+          double in = fmin (p / 0.12, 1), out = fmin ((1 - p) / 0.12, 1);
+
+          in *= in * (3 - 2 * in);
+          out *= out * (3 - 2 * out);
+          u.zoom = reach * in * out * (1 + 0.2 * p);
+        }
+      else if (kind == GLITCH_SCROLL)
+        {
+          /* Gathering speed over one width of the image, then past the
+             mark and back, shaking, until it rests where it began.  */
+          double q = t / len / 0.7, r = (q - 1) * 0.7 / 0.3;
+
+          u.scroll = (q < 1 ? q * q
+                      : 1 + (0.05 * sin (6 * M_PI * r)
+                             + 0.006 * (glitch_random () - 0.5) * (1 - r))
+                            * exp (-5 * r) * intensity);
+        }
+      else if (hard && t < len)
         {
           double e = sqrt (sin (M_PI * t / len));
 
@@ -7855,7 +8074,7 @@ glitch_random (void)
 
   /* End on the clean image, identical to the layer below unless this
      is a CRT, which stays up.  */
-  u.focus = u.split = u.tear = u.blocks = u.noise = 0;
+  u.focus = u.split = u.tear = u.blocks = u.noise = u.zoom = u.scroll = 0;
   [self render: &u wait: YES];
   if (!look.crt)
     [self show: NO];
@@ -7934,6 +8153,7 @@ ns_drop_effect (EmacsEffect **effect)
 
   [backgroundImageLayer setContents: backgroundImage];
   [backgroundImageLayer setFrame: bounds];
+  [backgroundImageLayer setOpacity: 1 - backgroundImageFade];
   if ([backgroundImageLayer superlayer] != frameLayer)
     {
       [backgroundImageLayer removeFromSuperlayer];
@@ -7952,12 +8172,12 @@ ns_drop_effect (EmacsEffect **effect)
     {
       EffectUniforms look = { .crt = crtTarget == 1 ? crtIntensity : 0,
                               .pitch = crtPitch, .mask = crtMask,
-                              .curve = crtCurve };
+                              .curve = crtCurve, .kind = crtKind };
 
       backgroundEffect = [[EmacsEffect alloc] initWithImage: backgroundImage
                                                    interval: glitchInterval
                                                   intensity: glitchIntensity
-                                                       hard: glitchHard
+                                                      kinds: glitchKinds
                                                        look: look];
     }
   [self placeEffect: backgroundEffect in: backgroundImageLayer z: -2];
@@ -7996,10 +8216,10 @@ ns_drop_effect (EmacsEffect **effect)
   else if (!glassEffect)
     {
       EffectUniforms look = { .crt = crtIntensity, .pitch = crtPitch,
-                              .mask = crtMask };
+                              .mask = crtMask, .kind = crtKind };
 
       glassEffect = [[EmacsEffect alloc] initWithImage: nil interval: 0
-                                             intensity: 1 hard: 0 look: look];
+                                             intensity: 1 kinds: 0 look: look];
     }
   [self placeEffect: glassEffect in: frameLayer z: 2];
 
@@ -8011,7 +8231,7 @@ ns_drop_effect (EmacsEffect **effect)
       EffectUniforms look = { .noise = noiseIntensity, .pitch = 1 };
 
       staticEffect = [[EmacsEffect alloc] initWithImage: nil interval: 0
-                                              intensity: 1 hard: 0 look: look];
+                                              intensity: 1 kinds: 0 look: look];
     }
   [self placeEffect: staticEffect in: snow z: noiseTarget == 2 ? 1 : -1];
 }
@@ -8026,12 +8246,19 @@ ns_drop_effect (EmacsEffect **effect)
 }
 
 
+- (void)setBackgroundImageAlpha: (double)alpha
+{
+  backgroundImageFade = 1 - alpha;
+  [self attachBackgroundImage];
+}
+
+
 - (void)setBackgroundGlitch: (double)interval intensity: (double)intensity
-                        hard: (double)hard
+                       kinds: (int)which
 {
   glitchInterval = interval;
   glitchIntensity = intensity;
-  glitchHard = hard;
+  glitchKinds = which;
   /* The renderer takes its settings once, so start a new one.  */
   ns_drop_effect (&backgroundEffect);
   [self attachBackgroundImage];
@@ -8041,11 +8268,14 @@ ns_drop_effect (EmacsEffect **effect)
 /* TARGET is 0 for no CRT, 1 for the background image, 2 for the whole
    frame.  INTENSITY and CURVATURE are fractions, PITCH is a scanline's
    height in points, and MASK is 0 for an aperture grille, 1 for a slot
-   mask, 2 for a shadow mask.  */
+   mask, 2 for a shadow mask.  KIND is the look: 0 CRT-Royale, 1
+   CRT-Lottes, 2 NewPixie.  */
 - (void)setCRT: (int)target intensity: (double)intensity
       scanline: (double)pitch mask: (int)mask curvature: (double)curvature
+          kind: (int)kind
 {
   crtTarget = intensity > 0 ? target : 0;
+  crtKind = kind;
   crtIntensity = intensity;
   crtPitch = pitch;
   crtMask = mask;

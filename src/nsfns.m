@@ -329,14 +329,34 @@ ns_set_background_image (struct frame *f, Lisp_Object new_value,
 /* Make F's `ns-background-image' glitch now and then if NEW_VALUE is
    non-nil.  NEW_VALUE may be a plist: :interval is the mean seconds
    between bursts (default 11), :intensity a percentage of the designed
-   strength (default 100, up to 200), and :style `drift', `hard' or
-   `both' (the default).  */
+   strength (default 100, up to 200), and :style what a burst may be:
+   `drift', `hard', `zoom', `scroll', `both' (the first two, and the
+   default), `all', or a list of those.  */
+static int
+ns_glitch_kinds (Lisp_Object style)
+{
+  int kinds = 0;
+
+  if (!CONSP (style))
+    return (EQ (style, Qdrift) ? GLITCH_DRIFT
+            : EQ (style, Qhard) ? GLITCH_HARD
+            : EQ (style, Qzoom) ? GLITCH_ZOOM
+            : EQ (style, Qscroll) ? GLITCH_SCROLL
+            : EQ (style, Qboth) ? GLITCH_DRIFT | GLITCH_HARD
+            : EQ (style, Qall) ? GLITCH_ALL : 0);
+  FOR_EACH_TAIL_SAFE (style)
+    if (!CONSP (XCAR (style)))
+      kinds |= ns_glitch_kinds (XCAR (style));
+  return kinds;
+}
+
 static void
 ns_set_background_glitch (struct frame *f, Lisp_Object new_value,
                           Lisp_Object old_value)
 {
   EmacsView *view = FRAME_NS_VIEW (f);
-  double interval = NILP (new_value) ? 0 : 11, intensity = 100, hard = 0.55;
+  double interval = NILP (new_value) ? 0 : 11, intensity = 100;
+  int kinds = GLITCH_DRIFT | GLITCH_HARD;
 
   if (CONSP (new_value))
     {
@@ -347,14 +367,15 @@ ns_set_background_glitch (struct frame *f, Lisp_Object new_value,
       if (NUMBERP (v))
         intensity = fmax (0, fmin (XFLOATINT (v), 200));
       v = plist_get (new_value, QCstyle);
-      hard = EQ (v, Qdrift) ? 0 : EQ (v, Qhard) ? 1 : hard;
+      if (ns_glitch_kinds (v))
+        kinds = ns_glitch_kinds (v);
     }
 
   if (view)
     {
       block_input ();
       [view setBackgroundGlitch: interval intensity: intensity / 100
-                           hard: hard];
+                          kinds: kinds];
       unblock_input ();
     }
 }
@@ -385,13 +406,15 @@ ns_effect_number (Lisp_Object value, Lisp_Object key, double def,
    lay the scanlines and phosphor mask over the whole frame; :intensity
    is a percentage (default 100); :scanline is a scanline's height in
    points (default 4); :mask is `grille', `slot' (the default) or
-   `shadow'; and :curvature is a percentage (default 0) by which the
-   background image bulges.  */
+   `shadow'; :curvature is a percentage (default 0) by which the
+   background image bulges; and :look is `royale' (the default) for
+   CRT-Royale, `lottes' for CRT-Lottes or `newpixie' for NewPixie.  */
 static void
 ns_set_crt (struct frame *f, Lisp_Object new_value, Lisp_Object old_value)
 {
   EmacsView *view = FRAME_NS_VIEW (f);
   Lisp_Object mask = CONSP (new_value) ? plist_get (new_value, QCmask) : Qnil;
+  Lisp_Object look = CONSP (new_value) ? plist_get (new_value, QClook) : Qnil;
 
   if (view)
     {
@@ -400,7 +423,8 @@ ns_set_crt (struct frame *f, Lisp_Object new_value, Lisp_Object old_value)
          intensity: ns_effect_number (new_value, QCintensity, 100, 0, 100) / 100
           scanline: ns_effect_number (new_value, QCscanline, 4, 1, 16)
               mask: EQ (mask, Qgrille) ? 0 : EQ (mask, Qshadow) ? 2 : 1
-         curvature: ns_effect_number (new_value, QCcurvature, 0, 0, 100) / 100];
+         curvature: ns_effect_number (new_value, QCcurvature, 0, 0, 100) / 100
+              kind: EQ (look, Qlottes) ? 1 : EQ (look, Qnewpixie) ? 2 : 0];
       unblock_input ();
     }
 }
@@ -441,6 +465,61 @@ ns_set_dim_unfocused (struct frame *f, Lisp_Object new_value,
       [view setPaneDim: (NUMBERP (new_value)
                          ? fmax (0, fmin (XFLOATINT (new_value), 1))
                          : NILP (new_value) ? 0 : 0.3)];
+      unblock_input ();
+    }
+}
+
+/* Draw F's text with a halo when the background is translucent
+   (`alpha-background'), so that it can be read over whatever shows
+   through.  NEW_VALUE is nil for none, t for the default, a number for
+   the blur in points (up to 16), or a plist: :size the blur (default
+   2), :intensity a percentage of the default strength (0 to 400), and
+   :color the halo's colour (default each face's background).  */
+static void
+ns_set_text_shadow (struct frame *f, Lisp_Object new_value,
+                    Lisp_Object old_value)
+{
+  struct ns_output *out = FRAME_OUTPUT_DATA (f);
+  Lisp_Object color = CONSP (new_value) ? plist_get (new_value, QCcolor) : Qnil;
+  NSColor *col = nil;
+
+  block_input ();
+  if (STRINGP (color) && ns_lisp_to_color (color, &col))
+    {
+      unblock_input ();
+      store_frame_param (f, Qns_text_shadow, old_value);
+      error ("Unknown color");
+    }
+  out->text_shadow_color_p = col != nil;
+  if (col)
+    out->text_shadow_color = [col unsignedLong];
+  unblock_input ();
+
+  out->text_shadow
+    = (NUMBERP (new_value) ? fmax (0, fmin (XFLOATINT (new_value), 16))
+       : CONSP (new_value) ? ns_effect_number (new_value, QCsize, 2, 0, 16)
+       : NILP (new_value) ? 0 : 2);
+  out->text_shadow_strength
+    = ns_effect_number (new_value, QCintensity, 100, 0, 400) / 100;
+  if (FRAME_VISIBLE_P (f))
+    SET_FRAME_GARBAGED (f);
+}
+
+/* Fade F's `ns-background-image' to NEW_VALUE, a fraction from 0.0 to
+   1.0 or a percentage from 0 to 100, leaving the text as it is.  nil is
+   fully opaque.  */
+static void
+ns_set_background_image_alpha (struct frame *f, Lisp_Object new_value,
+                               Lisp_Object old_value)
+{
+  EmacsView *view = FRAME_NS_VIEW (f);
+  double alpha = (FIXNUMP (new_value) ? XFIXNUM (new_value) / 100.0
+                  : FLOATP (new_value) ? XFLOAT_DATA (new_value) : 1);
+
+  if (view)
+    {
+      block_input ();
+      [view setBackgroundImageAlpha: fmax (0, fmin (alpha, 1))];
       unblock_input ();
     }
 }
@@ -1278,6 +1357,8 @@ frame_parm_handler ns_frame_parm_handlers[] =
   ns_set_crt,
   ns_set_interference,
   ns_set_dim_unfocused,
+  ns_set_text_shadow,
+  ns_set_background_image_alpha,
 #endif
   NULL,
   NULL,
@@ -1725,6 +1806,10 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame,
                          NULL, NULL, RES_TYPE_BOOLEAN);
   gui_default_parameter (f, parms, Qns_dim_unfocused, Qnil,
                          NULL, NULL, RES_TYPE_BOOLEAN);
+  gui_default_parameter (f, parms, Qns_text_shadow, Qnil,
+                         NULL, NULL, RES_TYPE_BOOLEAN);
+  gui_default_parameter (f, parms, Qns_background_image_alpha, Qnil,
+                         NULL, NULL, RES_TYPE_NUMBER);
 #endif
   gui_default_parameter (f, parms, Qborders_respect_alpha_background, Qnil,
                          "bordersRespectAlphaBackground",
@@ -4400,10 +4485,15 @@ syms_of_nsfns (void)
   DEFSYM (QCintensity, ":intensity");
   DEFSYM (Qdrift, "drift");
   DEFSYM (Qhard, "hard");
+  DEFSYM (Qzoom, "zoom");
+  DEFSYM (Qscroll, "scroll");
   DEFSYM (QCtarget, ":target");
   DEFSYM (QCscanline, ":scanline");
   DEFSYM (QCcurvature, ":curvature");
   DEFSYM (Qgrille, "grille");
+  DEFSYM (QClook, ":look");
+  DEFSYM (Qlottes, "lottes");
+  DEFSYM (Qnewpixie, "newpixie");
   DEFSYM (Qshadow, "shadow");
   DEFSYM (Qlight, "light");
 

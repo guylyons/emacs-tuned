@@ -40,16 +40,32 @@ Frame parameters
   ns-background-image    An image file under the text, filling the
                          window including the title bar, tinted.
   ns-background-glitch   Now and then the background image drifts out
-                         of focus or breaks up like damaged video.
-                         Plist: :interval, :intensity, :style.
-  ns-crt                 A CRT after RetroArch's CRT-Royale: scanlines,
-                         halation, phosphor mask, curvature.  Plist:
-                         :target, :intensity, :scanline, :mask,
-                         :curvature.
+                         of focus, breaks up like damaged video, pushes
+                         in on a random point, or scrolls off to the
+                         right and round into place with a bounce.
+                         Plist: :interval, :intensity, :style (drift,
+                         hard, zoom, scroll, both, all, or a list).
+  ns-crt                 A CRT: scanlines, phosphor mask, curvature.
+                         Plist: :target, :intensity, :scanline, :mask,
+                         :curvature, :look.  :look picks the libretro
+                         shader followed: royale (CRT-Royale, the
+                         default), lottes (CRT-Lottes) or newpixie
+                         (NewPixie, whose scanline rolls, so it
+                         renders every frame).  Lottes and NewPixie
+                         were written from the shader source and have
+                         not been checked side by side.
   ns-interference        Television snow.  Plist: :target, :intensity.
   ns-dim-unfocused       Panes other than the focused one fade into the
                          frame's background, as Ghostty's unfocused
                          splits do.  t for 0.3, or a number 0 to 1.
+  ns-text-shadow         Text over a translucent background gets a halo
+                         in its face's background colour.  t for 2
+                         points of blur, or a number up to 16.  Drawn
+                         in macfont_draw (src/macfont.m); about doubles
+                         the time to draw text.
+  A new parameter needs an entry in three lists kept in step: the
+  frame_parms table and enum x_frame_parameter in src/frame.c, and
+  ns_frame_parm_handlers in src/nsfns.m.
                          One shape layer with a hole over the focused
                          pane, updated from ns_update_end
                          (updatePaneDim in src/nsterm.m).

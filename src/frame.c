@@ -4164,6 +4164,8 @@ static const struct frame_parm_table frame_parms[] =
   {"ns-crt",			SYMBOL_INDEX (Qns_crt)},
   {"ns-interference",		SYMBOL_INDEX (Qns_interference)},
   {"ns-dim-unfocused",		SYMBOL_INDEX (Qns_dim_unfocused)},
+  {"ns-text-shadow",		SYMBOL_INDEX (Qns_text_shadow)},
+  {"ns-background-image-alpha",	SYMBOL_INDEX (Qns_background_image_alpha)},
 #endif
 
   {"display",			SYMBOL_INDEX (Qdisplay)},
@@ -4246,6 +4248,8 @@ enum x_frame_parameter
   NS_CRT,
   NS_INTERFERENCE,
   NS_DIM_UNFOCUSED,
+  NS_TEXT_SHADOW,
+  NS_BACKGROUND_IMAGE_ALPHA,
 #endif
   DISPLAY,
   LEFT,
@@ -7724,6 +7728,8 @@ syms_of_frame (void)
   DEFSYM (Qns_crt, "ns-crt");
   DEFSYM (Qns_interference, "ns-interference");
   DEFSYM (Qns_dim_unfocused, "ns-dim-unfocused");
+  DEFSYM (Qns_text_shadow, "ns-text-shadow");
+  DEFSYM (Qns_background_image_alpha, "ns-background-image-alpha");
 #endif
 
   DEFSYM (Qalpha, "alpha");
