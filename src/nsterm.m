@@ -10934,39 +10934,13 @@ static void cancel_ns_deferred_UAZoomChangeFocus_timer ()
       srcRect.size.height += d;
     }
 
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+  CGContextFlush ([(EmacsLayer *)[self layer] getContext]);
+  [(EmacsLayer *)[self layer] moveRect: srcRect to: dest];
+#else
   NSRect dstRect = NSMakeRect (dest.x, dest.y, NSWidth (srcRect),
                                NSHeight (srcRect));
 
-#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
-  CGContextRef context = [(EmacsLayer *)[self layer] getContext];
-  CGContextFlush (context);
-  [(EmacsLayer *)[self layer] damageRect: dstRect];
-
-  double scale = [[self window] backingScaleFactor];
-  int bpp = CGBitmapContextGetBitsPerPixel (context) / 8;
-  void *pixels = CGBitmapContextGetData (context);
-  int rowSize = CGBitmapContextGetBytesPerRow (context);
-  int srcRowSize = NSWidth (srcRect) * scale * bpp;
-  void *srcPixels = (char *) pixels
-    + (int) (NSMinY (srcRect) * scale * rowSize
-             + NSMinX (srcRect) * scale * bpp);
-  void *dstPixels = (char *) pixels
-    + (int) (dest.y * scale * rowSize
-             + dest.x * scale * bpp);
-
-  if (NSIntersectsRect (srcRect, dstRect)
-      && NSMinY (srcRect) < NSMinY (dstRect))
-    for (int y = NSHeight (srcRect) * scale - 1 ; y >= 0 ; y--)
-      memmove ((char *) dstPixels + y * rowSize,
-               (char *) srcPixels + y * rowSize,
-               srcRowSize);
-  else
-    for (int y = 0 ; y < NSHeight (srcRect) * scale ; y++)
-      memmove ((char *) dstPixels + y * rowSize,
-               (char *) srcPixels + y * rowSize,
-               srcRowSize);
-
-#else
   hide_bell();              // Ensure the bell image isn't scrolled.
 
   ns_focus (emacsframe, &dstRect, 1);
@@ -12801,7 +12775,33 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
     }
 
   memset (stale, 0, sizeof stale);
-  damage = 0;
+  damage = pending = 0;
+}
+
+
+/* Whether EMACS_NS_CHECK_DAMAGE is set, which reports drawing that
+   went unrecorded.  */
+static bool
+ns_check_damage_p (void)
+{
+  static int check = -1;
+
+  if (check < 0)
+    check = getenv ("EMACS_NS_CHECK_DAMAGE") != NULL;
+  return check;
+}
+
+
+/* Copy those of BANDS that are still pending from the layer's
+   contents to the surface being drawn to.  */
+- (void) resolveBands: (uint64_t)bands
+{
+  bands &= pending;
+  if (bands)
+    {
+      pending &= ~bands;
+      [self copyContentsTo: currentSurface bands: bands];
+    }
 }
 
 
@@ -12818,9 +12818,89 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
   int top = floor (fmax (0, NSMinY (rect) * scale));
   int bottom = ceil (fmin (height, NSMaxY (rect) * scale));
 
+  uint64_t bands = 0;
+
   if (top < bottom)
     for (int band = top / rows; band <= (bottom - 1) / rows; band++)
-      damage |= 1ULL << band;
+      bands |= 1ULL << band;
+
+  [self resolveBands: bands];
+  damage |= bands;
+}
+
+
+/* Move the pixels of SRC, in the view's coordinates, to DEST in the
+   surface being drawn to.  A row whose band is still pending is read
+   from the layer's contents, and a band the move covers whole is not
+   copied first, so a scroll on a stale surface costs one copy of the
+   frame and not two.  */
+- (void) moveRect: (NSRect)src to: (NSPoint)dest
+{
+  if (!currentSurface)
+    return;
+
+  CGFloat scale = [self contentsScale];
+  IOSurfaceRef source = (IOSurfaceRef) [self contents];
+  size_t rowBytes = IOSurfaceGetBytesPerRow (currentSurface);
+  int width = IOSurfaceGetWidth (currentSurface);
+  int height = IOSurfaceGetHeight (currentSurface);
+  int rows = (height + 63) / 64;
+  int sx = NSMinX (src) * scale, sy = NSMinY (src) * scale;
+  int dx = dest.x * scale, dy = dest.y * scale;
+  int w = min (NSWidth (src) * scale, width - max (sx, dx));
+  int h = min (NSHeight (src) * scale, height - max (sy, dy));
+  uint64_t old = pending, touched = 0;
+
+  if (sx < 0 || sy < 0 || dx < 0 || dy < 0 || w <= 0 || h <= 0)
+    return;
+
+  for (int band = dy / rows; band <= (dy + h - 1) / rows; band++)
+    touched |= 1ULL << band;
+  damage |= touched;
+
+  char *to = IOSurfaceGetBaseAddress (currentSurface);
+  char *from = to;
+  if (old && source && source != currentSurface
+      && (IOSurfaceLock (source, kIOSurfaceLockReadOnly, nil)
+	  == kIOReturnSuccess))
+    from = IOSurfaceGetBaseAddress (source);
+  else
+    old = 0;
+
+  /* In the pending bands the move reaches, what it does not write
+     comes from the contents as it is: the rows above and below, and
+     the strips at the sides.  */
+  for (int band = dy / rows; band <= (dy + h - 1) / rows; band++)
+    if (old & (1ULL << band))
+      for (int r = band * rows; r < min ((band + 1) * rows, height); r++)
+	{
+	  char *t = to + r * rowBytes, *f = from + r * rowBytes;
+
+	  if (r < dy || r >= dy + h)
+	    memcpy (t, f, width * 4);
+	  else
+	    {
+	      memcpy (t, f, dx * 4);
+	      memcpy (t + (dx + w) * 4, f + (dx + w) * 4,
+		      (width - dx - w) * 4);
+	    }
+	}
+  pending &= ~(old & touched);
+
+  /* Rows within the surface may overlap: moving down, start from the
+     last row.  */
+  for (int i = 0; i < h; i++)
+    {
+      int y = dy > sy ? h - 1 - i : i;
+      bool stale_row = old & (1ULL << ((sy + y) / rows));
+
+      memmove (to + (dy + y) * rowBytes + dx * 4,
+	       (stale_row ? from : to) + (sy + y) * rowBytes + sx * 4,
+	       w * 4);
+    }
+
+  if (old)
+    IOSurfaceUnlock (source, kIOSurfaceLockReadOnly, nil);
 }
 
 
@@ -12911,9 +12991,16 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
       if (lockStatus != kIOReturnSuccess)
         NSLog (@"Failed to lock surface: %x", (unsigned int)lockStatus);
 
-      [self copyContentsTo:surface bands:bands];
-
       currentSurface = surface;
+
+      /* Copying the stale bands waits until they are drawn to or
+         displayed.  The check wants them now, to compare the rest.  */
+      pending = bands;
+      if (ns_check_damage_p ())
+        {
+          pending = 0;
+          [self copyContentsTo:surface bands:bands];
+        }
 
       context = CGBitmapContextCreate (IOSurfaceGetBaseAddress (currentSurface),
                                        IOSurfaceGetWidth (currentSurface),
@@ -12971,6 +13058,30 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 
   if (context && context != [[NSGraphicsContext currentContext] CGContext])
     {
+      if (!damage)
+        {
+          /* Nothing was drawn, as when ns_frame_up_to_date finds no
+             mouse highlight to change: keep the contents, and the
+             surface as stale as it was.  The contents stays last in
+             the cache, where getContext looks first.  */
+          [self releaseContext];
+          for (int i = 0; i < 3; i++)
+            if (!stale[i].surface)
+              {
+                stale[i].surface = currentSurface;
+                stale[i].bands = pending;
+                break;
+              }
+          pending = 0;
+          if ((id) currentSurface == [self contents])
+            [cache addObject:(id)currentSurface];
+          else
+            [cache insertObject:(id)currentSurface atIndex:0];
+          currentSurface = NULL;
+          return;
+        }
+
+      [self resolveBands: ~0ULL];
       [self releaseContext];
 
       [CATransaction begin];
@@ -13015,7 +13126,6 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
   size_t rowBytes = IOSurfaceGetBytesPerRow (destination);
   int height = IOSurfaceGetHeight (destination);
   int rows = (height + 63) / 64;
-  static int check = -1;
 
   NSTRACE_WHEN (NSTRACE_GROUP_FOCUS, "[EmacsLayer copyContentsTo:bands:]");
 
@@ -13041,9 +13151,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 
   /* With EMACS_NS_CHECK_DAMAGE set, report drawing that went
      unrecorded: the two surfaces should now be the same.  */
-  if (check < 0)
-    check = getenv ("EMACS_NS_CHECK_DAMAGE") != NULL;
-  if (check)
+  if (ns_check_damage_p ())
     for (int row = 0; row < height; row++)
       if (memcmp (destinationData + row * rowBytes,
 		  sourceData + row * rowBytes,

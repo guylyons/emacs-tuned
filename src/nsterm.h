@@ -805,12 +805,17 @@ enum ns_return_frame_mode
      contents.  */
   uint64_t damage;
   struct { IOSurfaceRef surface; uint64_t bands; } stale[3];
+  /* The bands of the surface being drawn to that still differ from
+     the layer's contents.  They are copied only when drawn to or
+     displayed, so that a scroll can take them from the contents.  */
+  uint64_t pending;
 }
 - (id) initWithDoubleBuffered: (bool)db;
 - (void) setColorSpace: (CGColorSpaceRef)cs;
 - (void) setDoubleBuffered: (bool)db;
 - (CGContextRef) getContext;
 - (void) damageRect: (NSRect)rect;
+- (void) moveRect: (NSRect)src to: (NSPoint)dest;
 - (CGImageRef) copyImageOfRect: (NSRect)rect;
 @end
 #endif
